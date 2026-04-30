@@ -62,15 +62,22 @@ class PermissionService:
     async def check_bot_admin_status(self, bot: Bot, group_id: int) -> bool:
         """检查 Bot 自身在群内是否具有管理员权限"""
         try:
+            # 尝试使用 no_cache（go-cqhttp 扩展），失败则降级为标准调用
             bot_member = await bot.get_group_member_info(
                 group_id=group_id,
                 user_id=int(bot.self_id),
                 no_cache=True
             )
-            return bot_member.get("role") in ["owner", "admin"]
-        except Exception as e:
-            logger.error(f"[Permission] Failed to check bot status: {e}")
-            return False
+        except Exception:
+            try:
+                bot_member = await bot.get_group_member_info(
+                    group_id=group_id,
+                    user_id=int(bot.self_id)
+                )
+            except Exception as e:
+                logger.error(f"[Permission] Failed to check bot status: {e}")
+                return False
+        return bot_member.get("role") in ["owner", "admin"]
 
     async def ban_user(
         self,
@@ -128,13 +135,20 @@ class PermissionService:
             logger.error(f"[Kick] Execution failed: {e}")
             return f"❌ 踢人失败: {e}"
 
+    async def _fetch_group_history(self, bot: Bot, group_id: int) -> list:
+        """拉取群历史消息。当前依赖 go-cqhttp 扩展 API 'get_group_msg_history'。"""
+        try:
+            history = await bot.call_api("get_group_msg_history", group_id=group_id)
+            return history.get("messages", [])
+        except Exception as e:
+            logger.warning(f"[Audit] Fetch history failed: {e}")
+            raise
+
     async def ai_audit_and_punish(self, bot: Bot, group_id: int, target_id: int) -> str:
         """AI 智能审计：拉取用户最近发言，判断是否违规，若违规自动禁言。"""
         try:
-            history = await bot.call_api("get_group_msg_history", group_id=group_id)
-            messages = history.get("messages", [])
-        except Exception as e:
-            logger.warning(f"[Audit] Fetch history failed: {e}")
+            messages = await self._fetch_group_history(bot, group_id)
+        except Exception:
             return "❌ 获取聊天记录失败，无法进行 AI 审计。"
 
         user_msgs = []
@@ -221,7 +235,7 @@ class PermissionService:
             "天": 86400, "day": 86400, "d": 86400
         }
 
-        match = re.search(r'(\d+)\s*([\u4e00-\u9fa5a-z]+)?', text)
+        match = re.search(r'(\d+)\s*([一-龥a-z]+)?', text)
         if match:
             value = int(match.group(1))
             unit = match.group(2)

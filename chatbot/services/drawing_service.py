@@ -39,7 +39,7 @@ class DrawingService:
         try:
             enhanced_prompt = await asyncio.wait_for(
                 self._enhance_prompt(simple_prompt),
-                timeout=15.0
+                timeout=plugin_config.drawing_enhance_timeout
             )
         except asyncio.TimeoutError:
             enhanced_prompt = simple_prompt  # 降级策略

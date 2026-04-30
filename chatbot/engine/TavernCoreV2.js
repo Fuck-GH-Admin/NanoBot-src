@@ -15,6 +15,7 @@ class TavernCoreV2 {
     this.charCard = charCard;
     this.settings = userSettings;
     this.worldInfoEntries = worldInfoEntries;
+    this.systemTools = []; // Python 端通过 server.js 注入的工具定义
     this.worldInfoConfig = {
       maxDepth: worldInfoConfig.maxDepth ?? 2,
       budget: worldInfoConfig.budget ?? 25,
@@ -277,6 +278,7 @@ class TavernCoreV2 {
     const totalTokens = await countTokens(finalMessages);
     return {
       messages: finalMessages,
+      tools: this.systemTools,
       tokenInfo: {
         totalTokens,
         maxTokens,

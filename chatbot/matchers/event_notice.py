@@ -9,7 +9,7 @@ from nonebot.log import logger
 
 from ..config import plugin_config
 from ..consts import POKE_REPLIES
-from ..services import img_srv, llm_srv  # 可以用 simple_chat 生成欢迎语
+from ..services import img_srv, agent_srv
 
 # ---------- 戳一戳 ----------
 poke = on_notice(priority=5, block=True)
@@ -57,6 +57,7 @@ async def handle_poke(bot: Bot, event: PokeNotifyEvent):
 
 
 # ---------- 进出群欢迎 ----------
+# 同一 matcher 下通过事件类型注解自动分发：GroupIncreaseNoticeEvent → handle_increase, GroupDecreaseNoticeEvent → handle_decrease
 welcome = on_notice(priority=5, block=False)
 
 async def check_group(group_id: str) -> bool:
@@ -70,10 +71,12 @@ async def handle_increase(bot: Bot, event: GroupIncreaseNoticeEvent):
     if plugin_config.welcome_mode not in ["hello", "all"]: return
     if not await check_group(str(event.group_id)): return
     try:
-        reply = await llm_srv.simple_chat("system_welcome",
-            "用可爱温暖的语气欢迎一位新朋友加入群聊，30字以内，可以加表情")
+        ctx = {"bot": bot, "user_id": str(event.user_id), "group_id": event.group_id, "is_admin": False, "allow_r18": False}
+        result = await agent_srv.run_agent("system_welcome",
+            "用可爱温暖的语气欢迎一位新朋友加入群聊，30字以内，可以加表情", ctx)
+        reply = result.get("text", "欢迎新朋友加入～")
         await welcome.finish(MessageSegment.at(event.user_id) + f" {reply}")
-    except:
+    except Exception:
         await welcome.finish(MessageSegment.at(event.user_id) + " 欢迎新朋友加入～")
 
 @welcome.handle()
@@ -87,8 +90,10 @@ async def handle_decrease(bot: Bot, event: GroupDecreaseNoticeEvent):
             info = await bot.get_group_member_info(group_id=event.group_id, user_id=event.user_id)
             name = info.get("nickname", "群友")
         except: pass
-        reply = await llm_srv.simple_chat("system_welcome",
-            f"用有点伤感但不过分的语气说再见，提到“{name}”，25字以内")
+        ctx = {"bot": bot, "user_id": str(event.user_id), "group_id": event.group_id, "is_admin": False, "allow_r18": False}
+        result = await agent_srv.run_agent("system_welcome",
+            f"用有点伤感但不过分的语气说再见，提到“{name}”，25字以内", ctx)
+        reply = result.get("text", f"{name} 离开了大家庭...常回来看看哦")
         await welcome.finish(reply)
-    except:
+    except Exception:
         await welcome.finish(f"{name} 离开了大家庭...常回来看看哦")

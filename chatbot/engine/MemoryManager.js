@@ -23,16 +23,15 @@ class MemoryManager {
         if (typeof maxHistoryLength !== 'number' || maxHistoryLength <= 0) {
             throw new Error('maxHistoryLength 必须是一个大于 0 的数字');
         }
-        if (!apiKey || typeof apiKey !== 'string') {
-            throw new Error('必须提供有效的 DeepSeek API 密钥');
-        }
 
         /** @type {number} 触发总结的消息条数阈值 */
         this.maxHistoryLength = maxHistoryLength;
         /** @type {string} DeepSeek API Key */
-        this.apiKey = apiKey;
+        this.apiKey = apiKey || process.env.DEEPSEEK_API_KEY || '';
         /** @type {string} API 基础 URL */
-        this.baseURL = 'https://api.deepseek.com/chat/completions';
+        this.baseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/chat/completions';
+        /** @type {boolean} 标记是否有可用的 API Key */
+        this.hasValidKey = !!this.apiKey;
     }
 
     /**
@@ -48,6 +47,15 @@ class MemoryManager {
         // 参数校验
         if (!Array.isArray(chatHistory)) {
             throw new Error('chatHistory 必须是一个数组');
+        }
+
+        // 如果没有有效的 API Key，跳过总结
+        if (!this.hasValidKey) {
+            console.warn('[MemoryManager] 未配置 API Key，跳过记忆总结。');
+            return {
+                newHistory: chatHistory,
+                newSummary: existingSummary
+            };
         }
 
         // 如果未超过阈值，直接返回原始历史和现有摘要
@@ -142,11 +150,11 @@ class MemoryManager {
         const response = await axios.post(
             this.baseURL,
             {
-                model: 'deepseek-chat',
+                model: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
                 messages: messages,
                 stream: false,
-                temperature: 0.3,  // 较低温度保证总结稳定
-                max_tokens: 2000  // 可根据需要调整
+                temperature: parseFloat(process.env.SUMMARY_TEMPERATURE) || 0.3,
+                max_tokens: parseInt(process.env.SUMMARY_MAX_TOKENS) || 2000
             },
             {
                 headers: {

@@ -21,7 +21,7 @@ class AgentService:
 
     def __init__(self):
         self.repo = MemoryRepository()
-        self.node_url = getattr(plugin_config, "node_chat_url", "http://127.0.0.1:3000/api/chat")
+        self.node_url = plugin_config.node_chat_url
         self.registry = ToolRegistry()
         self._register_tools()
 
@@ -67,7 +67,7 @@ class AgentService:
             messages.extend(chat_history[-20:])  # 只保留最近 20 轮
         messages.append({"role": "user", "content": text})
 
-        max_loops = 5
+        max_loops = plugin_config.agent_max_loops
         all_images = []
 
         for _ in range(max_loops):
@@ -78,7 +78,7 @@ class AgentService:
             }
 
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient(timeout=plugin_config.agent_request_timeout) as client:
                     resp = await client.post(self.node_url, json=payload)
                 if resp.status_code != 200:
                     logger.error(f"[Agent] Node API error {resp.status_code}: {resp.text}")

@@ -26,4 +26,5 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-app.listen(3000, () => console.log('TavernCore Server running on port 3000'));
+const PORT = process.env.NODE_PORT || 3010;
+app.listen(PORT, () => console.log(`TavernCore Server running on port ${PORT}`));

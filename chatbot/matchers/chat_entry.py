@@ -1,28 +1,33 @@
 # src/plugins/chatbot/matchers/chat_entry.py
 
+from typing import Union
+
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent, MessageSegment
 from nonebot.params import EventPlainText
 from nonebot.log import logger
 
 from ..services.agent_service import AgentService
-from ..services.permission_service import PermissionService
-from ..services import img_srv, draw_srv, book_srv, perm_srv  # 已有单例
+from ..services import img_srv, draw_srv, book_srv, perm_srv
 
 agent = AgentService()
 
 # 优先级 10，普通消息
 chat_entry = on_message(priority=10, block=False)
 
+
 @chat_entry.handle()
-async def handle_chat(bot: Bot, event, text: str = EventPlainText()):
+async def handle_chat(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], text: str = EventPlainText()):
     # 仅处理 @机器人 的消息（群聊）或私聊
     is_group = isinstance(event, GroupMessageEvent)
     is_private = isinstance(event, PrivateMessageEvent)
 
     if is_group:
-        if not event.is_tome():
-            return
+        try:
+            if not event.is_tome():
+                return
+        except Exception:
+            return  # 无法判断是否提及 Bot 时，静默跳过
     elif is_private:
         # 私聊直接回复（可加白名单检查，但由 config 控制）
         pass

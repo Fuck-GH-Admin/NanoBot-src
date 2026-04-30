@@ -31,6 +31,17 @@ class Config(BaseSettings):
     siliconflow_api_url: str = "https://api.siliconflow.cn/v1"
     siliconflow_model_name: str = "Kwai-Kolors/Kolors"
 
+    # Node.js 引擎
+    node_chat_url: str = "http://127.0.0.1:3000/api/chat"
+    node_deepseek_api_key: str = ""
+    node_model: str = "deepseek-chat"
+    node_temperature: float = 0.7
+
+    # Agent 循环
+    agent_max_loops: int = 5
+    agent_request_timeout: float = 60.0
+    drawing_enhance_timeout: float = 15.0
+
     # 开关 / 超时
     enable_ai_command_fixer: bool = True
     ai_command_timeout: float = 9.0
@@ -109,6 +120,13 @@ class ConfigManager:
             "deepseek_api_key": "",
             "deepseek_api_url": "https://api.deepseek.com/chat/completions",
             "deepseek_model_name": "deepseek-v4-flash",
+            "node_chat_url": "http://127.0.0.1:3000/api/chat",
+            "node_deepseek_api_key": "",
+            "node_model": "deepseek-chat",
+            "node_temperature": 0.7,
+            "agent_max_loops": 5,
+            "agent_request_timeout": 60.0,
+            "drawing_enhance_timeout": 15.0,
             "siliconflow_api_key": "",
             "siliconflow_api_url": "https://api.siliconflow.cn/v1",
             "siliconflow_model_name": "Kwai-Kolors/Kolors",
@@ -191,6 +209,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             {key:"deepseek_api_key", label:"DeepSeek API Key", type:"text"},
             {key:"deepseek_api_url", label:"DeepSeek API URL", type:"text"},
             {key:"deepseek_model_name", label:"DeepSeek 模型名", type:"text"},
+            {key:"node_chat_url", label:"Node.js 引擎 URL", type:"text"},
+            {key:"node_deepseek_api_key", label:"Node.js DeepSeek API Key", type:"text"},
+            {key:"node_model", label:"Node.js 模型名", type:"text"},
+            {key:"node_temperature", label:"Node.js 温度参数", type:"number", step:"0.1"},
+            {key:"agent_max_loops", label:"Agent 最大循环次数", type:"number"},
+            {key:"agent_request_timeout", label:"Agent 请求超时(秒)", type:"number", step:"0.1"},
+            {key:"drawing_enhance_timeout", label:"绘图 Prompt 优化超时(秒)", type:"number", step:"0.1"},
             {key:"siliconflow_api_key", label:"SiliconFlow API Key", type:"text"},
             {key:"siliconflow_api_url", label:"SiliconFlow API URL", type:"text"},
             {key:"siliconflow_model_name", label:"SiliconFlow 模型名", type:"text"},

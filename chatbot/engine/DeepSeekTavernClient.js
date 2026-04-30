@@ -2,13 +2,18 @@ const axios = require('axios');
 const { TavernCoreV2 } = require('./TavernCoreV2');
 const MemoryManager = require('./MemoryManager'); // 引入 MemoryManager
 
-const DEEPSEEK_API_KEY = '';
-const BASE_URL = 'https://api.deepseek.com';
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
+const BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 
 class DeepSeekTavernClient {
     constructor(charCard, userSettings, worldInfoEntries = [], maxHistoryLength = 15) {
         this.engine = new TavernCoreV2(charCard, userSettings, worldInfoEntries);
-        this.memory = new MemoryManager(maxHistoryLength, DEEPSEEK_API_KEY); // 初始化记忆管理器
+        try {
+            this.memory = new MemoryManager(maxHistoryLength, DEEPSEEK_API_KEY);
+        } catch (e) {
+            console.warn('[DeepSeekTavernClient] MemoryManager not initialized:', e.message);
+            this.memory = null;
+        }
     }
 
     /**
@@ -41,13 +46,17 @@ class DeepSeekTavernClient {
             console.log('--- 组装后的 Prompt 结构 ---');
             console.log(JSON.stringify(messages, null, 2));
 
-            // 4. 请求 API
-            const response = await axios.post(`${BASE_URL}/chat/completions`, {
-                model: "deepseek-chat",
+            // 4. 请求 API（传入 tools 以启用 function calling）
+            const requestBody = {
+                model: process.env.DEEPSEEK_MODEL || "deepseek-chat",
                 messages: messages,
                 stream: false,
-                temperature: 0.7
-            }, {
+                temperature: parseFloat(process.env.LLM_TEMPERATURE) || 0.7,
+            };
+            if (this.engine.systemTools && this.engine.systemTools.length > 0) {
+                requestBody.tools = this.engine.systemTools;
+            }
+            const response = await axios.post(`${BASE_URL}/chat/completions`, requestBody, {
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
@@ -55,10 +64,19 @@ class DeepSeekTavernClient {
             });
 
             const reply = response.data.choices[0].message.content;
+            const tool_calls = response.data.choices[0].message.tool_calls || [];
 
-            // 5. 返回压缩后的状态供上层使用
+            // 5. 返回 OpenAI 兼容格式（Python 端 agent_service/drawing_service/permission_service 均依赖此格式）
             return {
-                reply,
+                choices: [{
+                    index: 0,
+                    message: {
+                        role: "assistant",
+                        content: reply,
+                        tool_calls: tool_calls,
+                    },
+                    finish_reason: tool_calls.length > 0 ? "tool_calls" : "stop",
+                }],
                 newSummary,
                 newHistory,
             };

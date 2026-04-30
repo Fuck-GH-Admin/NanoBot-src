@@ -5,11 +5,10 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.params import EventPlainText
 from nonebot.log import logger
 
-from ..services.permission_service import PermissionService
+from ..services import perm_srv
 
-perm_srv = PermissionService()
+admin_hard = on_message(priority=3, block=False)
 
-admin_hard = on_message(priority=3, block=True)
 
 @admin_hard.handle()
 async def handle_hard_admin(bot: Bot, event: GroupMessageEvent, text: str = EventPlainText()):
@@ -24,11 +23,12 @@ async def handle_hard_admin(bot: Bot, event: GroupMessageEvent, text: str = Even
         role = "member"
 
     if not perm_srv.has_command_privilege(user_id, role):
-        return  # 没有权限，放行给后面的 matcher
+        return  # block=False，事件继续向下传递
 
     # 退群指令
     if text == "退群" or text == "leave":
         await admin_hard.send("收到指令，正在退出群聊...")
         await bot.set_group_leave(group_id=event.group_id)
+        await admin_hard.finish()
 
     # 可以继续添加其他硬控，如重载配置、清空记忆等

@@ -1,6 +1,8 @@
 # src/plugins/chatbot/__init__.py
+import os
 import shutil
 import asyncio
+import threading
 import subprocess
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from nonebot import get_driver
 from nonebot.log import logger
 from nonebot.plugin import PluginMetadata
 
-from .config import Config, plugin_config
+from .config import Config, plugin_config, start_config_web_server
 
 # 导入所有事件响应器
 from .matchers import (
@@ -57,8 +59,8 @@ async def start_node_service():
     # 首次运行时自动安装 npm 依赖
     if not node_modules.exists():
         logger.info("正在安装 Node.js 依赖...")
-        proc = await asyncio.create_subprocess_exec(
-            "npm", "install",
+        proc = await asyncio.create_subprocess_shell(
+            "npm install",
             cwd=NODE_SERVER_DIR,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
@@ -70,9 +72,16 @@ async def start_node_service():
         logger.info("Node 依赖安装完成")
 
     logger.info("正在启动 Node.js 微服务...")
+    env = os.environ.copy()
+    env["DEEPSEEK_API_KEY"] = plugin_config.node_deepseek_api_key
+    env["DEEPSEEK_MODEL"] = plugin_config.node_model
+    env["LLM_TEMPERATURE"] = str(plugin_config.node_temperature)
+    env["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com"
+
     node_process = subprocess.Popen(
         ["node", str(NODE_SERVER_SCRIPT)],
         cwd=NODE_SERVER_DIR,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )
@@ -96,11 +105,20 @@ async def stop_node_service():
             node_process.kill()
         logger.info("Node.js 微服务已停止")
 
-# 注册生命周期钩子
+# ---------- Web 配置管理面板 ----------
 @driver.on_startup
-async def _boot_node():
+async def _boot_services():
+    # 启动 Node.js 微服务
     asyncio.create_task(start_node_service())
 
+    # 启动 Web 配置面板（后台线程，daemon 随主进程退出）
+    threading.Thread(
+        target=start_config_web_server,
+        args=(plugin_config, 8081),
+        daemon=True,
+    ).start()
+
+
 @driver.on_shutdown
-async def _shutdown_node():
+async def _shutdown_services():
     await stop_node_service()
