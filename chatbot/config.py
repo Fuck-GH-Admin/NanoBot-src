@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -6,7 +7,7 @@ from pathlib import Path
 from typing import Set, Optional, Any
 
 import yaml
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -15,6 +16,15 @@ from watchdog.events import FileSystemEventHandler
 CONFIG_FILE = Path("config_bot_base.yaml")
 # 管理面板端口（不要和 NoneBot 的端口冲突，这里用 8081）
 WEB_PORT = 8081
+
+
+class GroupSettings(BaseModel):
+    """群级配置"""
+    model_config = ConfigDict(extra="ignore")
+
+    random_reply_prob: float = Field(default=0.0, description="随机插嘴概率 (0.0~1.0)")
+    record_all_messages: bool = Field(default=True, description="是否记录所有非@消息")
+    allowed_tools: list[str] = Field(default_factory=lambda: ["all"], description="允许该群使用的工具列表，\"all\"表示全部")
 
 
 class Config(BaseSettings):
@@ -66,6 +76,8 @@ class Config(BaseSettings):
 
     welcome_mode: str = "all"
 
+    group_configs: dict[str, GroupSettings] = {}
+
 
 class ConfigManager:
     """负责从 YAML 加载配置、热更新、提供统一的属性访问"""
@@ -93,6 +105,17 @@ class ConfigManager:
                 field_info = Config.model_fields[key]
                 target_type = field_info.annotation
 
+                # group_configs 特殊处理：从 dict 转为 GroupSettings 对象
+                if key == "group_configs" and isinstance(value, dict):
+                    converted = {}
+                    for gid, gcfg in value.items():
+                        if isinstance(gcfg, dict):
+                            converted[gid] = GroupSettings(**gcfg)
+                        elif isinstance(gcfg, GroupSettings):
+                            converted[gid] = gcfg
+                    setattr(self._config, key, converted)
+                    continue
+
                 # 类型转换：YAML 读取的值可能不是精确类型
                 try:
                     if target_type is Set[str]:
@@ -113,6 +136,39 @@ class ConfigManager:
                     continue  # 类型转换失败则跳过该字段
 
                 setattr(self._config, key, value)
+
+    def save_config(self):
+        """将当前配置序列化并原子写回 YAML 文件"""
+        import tempfile
+
+        data = {}
+        try:
+            with self._lock:
+                for name, field_info in Config.model_fields.items():
+                    val = getattr(self._config, name)
+                    if isinstance(val, set):
+                        val = list(val)
+                    elif name == 'group_configs':
+                        val = {k: v.model_dump() if isinstance(v, GroupSettings) else v
+                               for k, v in val.items()}
+                    data[name] = val
+
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=CONFIG_FILE.parent,
+                                                 prefix=CONFIG_FILE.stem + '_',
+                                                 suffix='.tmp')
+            try:
+                with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+                os.replace(tmp_path, CONFIG_FILE)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                raise
+        except Exception as e:
+            print(f"[Config] 保存配置失败: {e}")
+            raise
 
     def _generate_default_yaml(self):
         """生成初始配置文件"""
@@ -233,7 +289,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             {key:"ai_admin_qq", label:"AI管理员", type:"text", isList:true},
             {key:"drawing_whitelist", label:"绘图白名单", type:"text", isList:true},
             {key:"welcome_groups", label:"欢迎/群管理群号", type:"text", isList:true},
-            {key:"welcome_mode", label:"欢迎模式", type:"select", opts:["all","hello","bye"]}
+            {key:"welcome_mode", label:"欢迎模式", type:"select", opts:["all","hello","bye"]},
+            {key:"group_configs", label:"群配置 (JSON格式)", type:"textarea",
+                help:"示例: {\"123456\": {\"random_reply_prob\": 0.05, \"record_all_messages\": true, \"allowed_tools\": [\"all\"]}}"},
         ];
 
         async function load() {
@@ -260,6 +318,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     cb.type = 'checkbox'; cb.name = f.key;
                     cb.checked = !!val;
                     div.appendChild(cb);
+                } else if (f.type === 'textarea') {
+                    const ta = document.createElement('textarea');
+                    ta.name = f.key;
+                    ta.rows = 6;
+                    if (f.isList && Array.isArray(val)) val = val.join(',');
+                    if (typeof val === 'object') val = JSON.stringify(val, null, 2);
+                    ta.value = val ?? '';
+                    div.appendChild(ta);
                 } else {
                     const inp = document.createElement('input');
                     inp.type = f.type; inp.name = f.key;
@@ -291,6 +357,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     payload[f.key] = parseFloat(fd.get(f.key));
                 } else if (f.key === 'short_message_max_len') {
                     payload[f.key] = parseInt(fd.get(f.key));
+                } else if (f.type === 'textarea') {
+                    const raw = fd.get(f.key) || '';
+                    try { payload[f.key] = JSON.parse(raw); } catch { payload[f.key] = raw; }
                 } else {
                     payload[f.key] = fd.get(f.key) || '';
                 }
@@ -333,6 +402,8 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
                     val = getattr(self.manager._config, name)
                     if isinstance(val, set):
                         val = list(val)
+                    elif name == 'group_configs':
+                        val = {k: v.model_dump() if isinstance(v, GroupSettings) else v for k, v in val.items()}
                     config_data[name] = val
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -361,6 +432,23 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
         for key, value in new_data.items():
             if key not in Config.model_fields:
                 continue
+            # group_configs 特殊处理
+            if key == 'group_configs':
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        errors.append("group_configs: Invalid JSON string")
+                        continue
+                if isinstance(value, dict):
+                    processed[key] = {}
+                    for gid, gcfg in value.items():
+                        try:
+                            processed[key][gid] = GroupSettings(**gcfg).model_dump()
+                        except Exception as e:
+                            errors.append(f"group_configs[{gid}]: {e}")
+                continue
+
             field_info = Config.model_fields[key]
             target_type = field_info.annotation
             try:
