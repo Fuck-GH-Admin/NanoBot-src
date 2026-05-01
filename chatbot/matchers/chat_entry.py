@@ -10,11 +10,9 @@ from nonebot.params import EventPlainText
 from nonebot.log import logger
 
 from ..config import plugin_config, GroupSettings
-from ..services.agent_service import AgentService
-from ..services import img_srv, draw_srv, book_srv, perm_srv
+from ..services import agent_srv, img_srv, draw_srv, book_srv, perm_srv
 from ..repositories.memory_repo import MemoryRepository
 
-agent = AgentService()
 memory_repo = MemoryRepository()
 
 chat_entry = on_message(priority=10, block=False)
@@ -123,7 +121,7 @@ async def handle_chat(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
         "book_service": book_srv,
     }
 
-    result = await agent.run_agent(user_id, text, context)
+    result = await agent_srv.run_agent(user_id, text, context)
     reply_text = result.get("text", "")
     images = result.get("images", [])
 

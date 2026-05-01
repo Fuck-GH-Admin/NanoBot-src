@@ -5,6 +5,7 @@ import shutil
 import asyncio
 import threading
 import subprocess
+from pathlib import Path
 
 from nonebot import get_driver
 from nonebot.log import logger
@@ -117,9 +118,9 @@ async def _boot_services():
     asyncio.create_task(start_node_service())
 
     # 启动记忆压缩消费者协程（仅高可用队列模式需要）
-    from .matchers.chat_entry import agent
+    from .services import agent_srv
     if plugin_config.enable_task_queue:
-        asyncio.create_task(agent.memory_service.start_consumer())
+        asyncio.create_task(agent_srv.memory_service.start_consumer())
 
     # 启动 Web 配置面板（后台线程，daemon 随主进程退出）
     threading.Thread(
@@ -131,12 +132,12 @@ async def _boot_services():
 
 @driver.on_shutdown
 async def _shutdown_services():
-    from .matchers.chat_entry import agent
+    from .services import agent_srv
 
     # 优雅关闭记忆压缩队列（drain → 等待 worker → 关闭 httpx）
-    await agent.memory_service.shutdown()
+    await agent_srv.memory_service.shutdown()
 
     # 清理 Agent HTTP 连接池
-    await agent.close()
+    await agent_srv.close()
 
     await stop_node_service()
