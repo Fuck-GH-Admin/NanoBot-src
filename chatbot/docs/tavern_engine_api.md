@@ -1,187 +1,117 @@
-# Tavern Engine API — 微服务接口规范
+# Tavern Engine API — Node.js Chat Endpoint
 
-**服务说明：** 基于 Node.js 的对话引擎微服务，通过 `/api/chat` 端点完成 ReAct 循环。接收带工具的对话历史，返回回复文本、新历史和工具调用指令。
+**Base URL:** `http://127.0.0.1:3010`
 
----
-
-## Endpoint
-
-```
-POST http://127.0.0.1:3000/api/chat
-```
-
-Content-Type: `application/json`
+**Server:** Express 4.x, stateless per-request architecture
 
 ---
 
-## Request Body Schema
+## POST `/api/chat`
+
+Compiles a prompt from character card + world book + context, calls DeepSeek API, returns raw OpenAI-compatible response.
+
+### Request Body
 
 ```json
 {
   "chatHistory": [
-    {
-      "role": "user",
-      "content": "帮我画一只猫"
-    },
-    {
-      "role": "assistant",
-      "content": "我帮你画一只猫。让我调用绘图工具。",
-      "tool_calls": [
-        {
-          "id": "call_abc123",
-          "type": "function",
-          "function": {
-            "name": "generate_image",
-            "arguments": "{\"prompt\": \"一只可爱的猫，水彩风格\"}"
-          }
-        }
-      ]
-    },
-    {
-      "role": "tool",
-      "tool_call_id": "call_abc123",
-      "name": "generate_image",
-      "content": "绘图成功，文件已保存到 /data/generated_images/cat.png"
-    }
+    {"role": "user", "content": "帮我画一只猫", "name": "Alice", "user_id": "111"},
+    {"role": "assistant", "content": "好的", "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "call_abc", "name": "generate_image", "content": "绘图成功"}
   ],
-  "existingSummary": "用户喜欢动物和风景画。之前画过一只狗和一座山。",
+  "existingSummary": "群组最近在讨论绘画。",
   "tools": [
     {
       "type": "function",
       "function": {
         "name": "generate_image",
         "description": "生成 AI 图片",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "prompt": {
-              "type": "string",
-              "description": "图片描述"
-            }
-          },
-          "required": ["prompt"]
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "search_acg_image",
-        "description": "搜索 ACG 图片",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "keyword": {
-              "type": "string",
-              "description": "搜索关键词"
-            },
-            "allow_r18": {
-              "type": "boolean",
-              "description": "是否允许 R18"
-            }
-          },
-          "required": ["keyword"]
-        }
+        "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}}
       }
     }
-  ]
+  ],
+  "userProfiles": {
+    "111": "likes cats; programmer",
+    "222": "friendly; artist"
+  },
+  "context": {
+    "group_id": 12345678,
+    "active_uids": ["111", "222"]
+  }
 }
 ```
 
-### 字段说明
+### Field Reference
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `chatHistory` | `Array<Message>` | 是 | 对话历史消息列表，每条包含 role/content，可选 tool_calls |
-| `existingSummary` | `string` | 否 | 已有对话摘要，用于压缩上下文 |
-| `tools` | `Array<OpenAITool>` | 否 | OpenAI 格式的工具定义数组 |
-| `user_id` | `string` | 否 | 用户 ID，用于个性化 |
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `chatHistory` | `Message[]` | Yes | Recent messages for prompt compilation |
+| `existingSummary` | `string` | No | Group macro summary (injected as `<group_memory>`) |
+| `tools` | `OpenAITool[]` | No | Function calling definitions |
+| `userProfiles` | `Record<string, string>` | No | `{user_id: "trait1; trait2"}` for active users |
+| `context` | `object` | No | `{group_id, active_uids}` for lorebook context-aware filtering |
 
-### Message 对象
+### Message Object
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `role` | `string` | 是 | `"user"` / `"assistant"` / `"tool"` / `"system"` |
-| `content` | `string` | 是 | 消息文本内容 |
-| `tool_calls` | `Array<ToolCall>` | 否 | assistant 消息中的工具调用（role=assistant 时） |
-| `tool_call_id` | `string` | 否 | 工具调用 ID（role=tool 时） |
-| `name` | `string` | 否 | 工具名称（role=tool 时） |
+| Field | Type | Description |
+|---|---|---|
+| `role` | `string` | `user` / `assistant` / `system` / `tool` |
+| `content` | `string` | Message text |
+| `name` | `string` | Display name (for multi-user group chat) |
+| `user_id` | `string` | QQ number (for profile lookup) |
+| `tool_calls` | `array` | OpenAI tool_calls (role=assistant only) |
+| `tool_call_id` | `string` | Tool call ID (role=tool only) |
 
----
-
-## Response Body Schema
+### Response Body
 
 ```json
 {
   "choices": [
     {
-      "index": 0,
       "message": {
         "role": "assistant",
-        "content": "好的，已经画好了！这是一只水彩风格的猫。",
-        "tool_calls": [
-          {
-            "id": "call_abc123",
-            "type": "function",
-            "function": {
-              "name": "generate_image",
-              "arguments": "{\"prompt\": \"一只可爱的猫，水彩风格\"}"
-            }
-          }
-        ]
+        "content": "好的，已经画好了！",
+        "tool_calls": null
       },
       "finish_reason": "stop"
     }
-  ],
-  "newHistory": [
-    { "role": "user", "content": "帮我画一只猫" },
-    { "role": "assistant", "content": "好的，已经画好了！这是一只水彩风格的猫。" }
-  ],
-  "newSummary": "用户喜欢动物和风景画。之前画过一只狗、一座山和一只猫。"
+  ]
 }
 ```
 
-### 字段说明
+> The response is a **raw OpenAI-compatible** `choices` array. State management (history, summary, profiles) is entirely on the Python side.
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `choices` | `Array<Choice>` | 是 | 模型回复（OpenAI 兼容格式） |
-| `newHistory` | `Array<Message>` | 否 | 更新后的对话历史（包含本轮），客户端应替换本地历史 |
-| `newSummary` | `string` | 否 | 更新后的对话摘要，客户端应替换本地摘要 |
+### Tool Call Flow
 
-### Choice 对象
+When `finish_reason` is `"tool_calls"`:
+1. Parse `message.tool_calls[].function.arguments` (JSON string)
+2. Execute the tool locally
+3. Append result as `{role: "tool", tool_call_id, name, content}` to `chatHistory`
+4. Re-POST to `/api/chat`
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `index` | `number` | 选项索引 |
-| `message` | `Message` | 回复消息 |
-| `finish_reason` | `string` | `"stop"` / `"tool_calls"` / `"length"` |
-
-### tool_calls 说明
-
-当 `finish_reason` 为 `"tool_calls"` 时，`message.tool_calls` 包含模型请求调用的工具列表。客户端应：
-1. 解析 `function.arguments`（JSON 字符串）
-2. 按 `function.name` 执行对应的本地工具
-3. 将工具结果以 `role: "tool"` 追加到历史
-4. 重新请求 `/api/chat` 继续循环
+Max loop: 5 iterations (controlled by Python `agent_service`).
 
 ---
 
-## 通信流程
+## POST `/api/reload`
 
-```
-Client (Python AgentService)          Server (Node.js Tavern Engine)
-         |                                      |
-         |--- POST /api/chat ------------------>|
-         |    {chatHistory, tools, user_id}      |
-         |                                      |
-         |<-- {choices, newHistory, newSummary} -|
-         |                                      |
-         |    if tool_calls exists:              |
-         |    执行工具 → 追加结果到 chatHistory   |
-         |    goto POST /api/chat                |
-         |                                      |
-         |    else: 返回最终回复给用户            |
+Hot-reloads `character.json` and `worldbook.json` from `engine/data/` directory.
+
+```json
+{"status": "success", "message": "Templates reloaded"}
 ```
 
-最大工具循环次数：**5 轮**（由客户端控制，防止无限循环）。
+---
+
+## Prompt Compilation Details
+
+The Node.js engine assembles the system prompt as XML blocks:
+
+```
+<role_play_setting>     ← character card (identity, personality, scenario)
+<world_knowledge>       ← lorebook scan results (wiBefore, wiAfter)
+<group_memory>          ← summary + user profiles (XML-escaped for injection defense)
+<system_directives>     ← jailbreak / post_history_instructions
+```
+
+User-sourced content is passed through `escapeXml()` before insertion.

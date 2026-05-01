@@ -1,81 +1,79 @@
+/**
+ * DeepSeekTavernClient — 纯粹的 Prompt 编译与 LLM 调用中枢
+ *
+ * 职责：
+ * 1. 将 Python 端传入的 chatHistory / summaryContext / userProfiles 编译为 OpenAI 消息
+ * 2. 调用 DeepSeek API
+ * 3. 透传原始 choices 返回给 Python 端
+ *
+ * 不持有任何运行时状态，不负责记忆压缩（已移交给 Python 端 memory_service）。
+ *
+ * 配置通过构造函数注入（由 server.js 在启动时从环境变量读取一次），禁止自行读取 process.env。
+ */
+
 const axios = require('axios');
 const { TavernCoreV2 } = require('./TavernCoreV2');
-const MemoryManager = require('./MemoryManager');
-
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
-const BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 
 class DeepSeekTavernClient {
-    constructor(charCard, userSettings, worldInfoEntries = [], maxHistoryLength = 15) {
+    /**
+     * @param {Object} charCard - 角色卡
+     * @param {Object} userSettings - 用户设置
+     * @param {Array}  worldInfoEntries - 世界书条目
+     * @param {Object} llmConfig - LLM 配置（由 server.js 从环境变量读取后注入）
+     * @param {string} llmConfig.apiKey - DeepSeek API Key
+     * @param {string} llmConfig.baseUrl - API 基础 URL
+     * @param {string} llmConfig.model - 模型名称
+     * @param {number} llmConfig.temperature - 采样温度
+     */
+    constructor(charCard, userSettings, worldInfoEntries = [], llmConfig = {}) {
         this.engine = new TavernCoreV2(charCard, userSettings, worldInfoEntries);
-        try {
-            this.memory = new MemoryManager(maxHistoryLength, DEEPSEEK_API_KEY);
-        } catch (e) {
-            console.warn('[DeepSeekTavernClient] MemoryManager not initialized:', e.message);
-            this.memory = null;
-        }
+        this.apiKey = llmConfig.apiKey;
+        this.baseUrl = llmConfig.baseUrl;
+        this.model = llmConfig.model;
+        this.temperature = llmConfig.temperature;
     }
 
     /**
-     * 发送聊天请求（自动处理历史压缩）
-     * @param {Array} chatHistory 原始聊天历史
-     * @param {string} [existingSummary=''] 已有的记忆摘要
-     * @param {number} [maxTokens=4000] 最大 token 数
-     * @param {Array} [tools=[]] OpenAI 格式的工具定义数组，显式传递避免全局竞态
-     * @returns {Promise<Object>} { choices, newSummary, newHistory }
+     * 发送聊天请求（无状态流水线）
+     *
+     * @param {Array}  chatHistory   - Python 端精确裁剪好的近期消息
+     * @param {string} [existingSummary=''] - 群组宏观摘要（作为背景上下文注入）
+     * @param {number} [maxTokens=4000]     - 最大响应 token 数
+     * @param {Array}  [tools=[]]           - OpenAI 格式的工具定义
+     * @param {Object} [userProfiles={}]    - 活跃群友画像 { user_id: "特征1; 特征2" }
+     * @returns {Promise<Object>} { choices }
      */
-    async ask(chatHistory, existingSummary = '', maxTokens = 4000, tools = []) {
-        try {
-            // 1. 先进行记忆压缩
-            const { newHistory, newSummary } = await this.memory.checkAndSummarize(
-                chatHistory,
-                existingSummary
-            );
+    async ask(chatHistory, existingSummary = '', maxTokens = 4000, tools = [], userProfiles = {}, context = {}, relations = []) {
+        // 1. 编译 Prompt：世界书扫描 + 系统提示 + 画像注入 + Token 预算截断
+        const summaryContext = (existingSummary && existingSummary.trim()) ? existingSummary : '';
+        const { messages } = await this.engine.buildOpenAIMessages(
+            chatHistory, maxTokens, summaryContext, userProfiles, context, relations
+        );
 
-            // 2. 如果产生了摘要，将其注入到历史中（通常作为系统消息）
-            const historyToSend = [...newHistory];
-            if (newSummary && newSummary.trim()) {
-                historyToSend.unshift({
-                    is_system: true,
-                    mes: `[Summary of previous events: ${newSummary}]`,
-                    name: 'System',
-                });
-            }
-
-            // 3. 构建 OpenAI 消息
-            const { messages } = await this.engine.buildOpenAIMessages(historyToSend, maxTokens);
-
-            // 4. 构造请求体，显式包含工具定义
-            const requestBody = {
-                model: process.env.DEEPSEEK_MODEL || "deepseek-chat",
-                messages: messages,
-                stream: false,
-                temperature: parseFloat(process.env.LLM_TEMPERATURE) || 0.7,
-            };
-            if (tools && tools.length > 0) {
-                requestBody.tools = tools;
-            }
-
-            // 5. 请求 DeepSeek API
-            const response = await axios.post(`${BASE_URL}/chat/completions`, requestBody, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
-                }
-            });
-
-            // 6. 透传 DeepSeek 原始 choices（OpenAI 兼容格式，含 tool_calls）
-            //    Python 端 agent_service / drawing_service / permission_service 均读取
-            //    data["choices"][0]["message"]["content"] 和 tool_calls
-            return {
-                choices: response.data.choices,
-                newSummary,
-                newHistory,
-            };
-        } catch (error) {
-            console.error('API 请求失败:', error.response?.data || error.message);
-            throw error;
+        // 2. 构造请求体
+        const requestBody = {
+            model: this.model,
+            messages: messages,
+            stream: false,
+            temperature: this.temperature,
+        };
+        if (tools && tools.length > 0) {
+            requestBody.tools = tools;
         }
+
+        // 3. 调用 DeepSeek API
+        const response = await axios.post(`${this.baseUrl}/chat/completions`, requestBody, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.apiKey}`
+            },
+            timeout: 120000,
+        });
+
+        // 4. 透传原始 choices（OpenAI 兼容格式，含 tool_calls）
+        return {
+            choices: response.data.choices,
+        };
     }
 }
 

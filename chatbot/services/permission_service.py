@@ -3,8 +3,8 @@
 import re
 import json
 import httpx
-from typing import Optional, Set, List, Dict, Union, Literal
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+from typing import Set, List, Literal
+from nonebot.adapters.onebot.v11 import Bot
 from nonebot.log import logger
 
 from ..config import plugin_config

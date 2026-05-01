@@ -1,7 +1,6 @@
 # src/plugins/chatbot/matchers/event_notice.py
 
 import random
-import asyncio
 from datetime import datetime, timedelta
 from nonebot import on_notice
 from nonebot.adapters.onebot.v11 import Bot, PokeNotifyEvent, GroupIncreaseNoticeEvent, GroupDecreaseNoticeEvent, MessageSegment

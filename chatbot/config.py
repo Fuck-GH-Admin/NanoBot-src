@@ -1,10 +1,11 @@
 import json
 import os
+import secrets
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Set, Optional, Any
+from typing import Set, Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -45,14 +46,23 @@ class Config(BaseSettings):
     siliconflow_model_name: str = "Kwai-Kolors/Kolors"
 
     # Node.js 引擎
-    node_chat_url: str = "http://127.0.0.1:3000/api/chat"
+    node_chat_url: str = "http://127.0.0.1:3010/api/chat"
     node_deepseek_api_key: str = ""
+    node_base_url: str = "https://api.deepseek.com"
     node_model: str = "deepseek-chat"
     node_temperature: float = 0.7
 
     # Agent 循环
-    agent_max_loops: int = 5
+    agent_max_loops: int = 10
     agent_request_timeout: float = 60.0
+
+    # Feature Flags（灰度开关）
+    enable_strict_schema: bool = True       # 阶段一：跨端 Schema 校验
+    enable_task_queue: bool = False         # 阶段二：高可用任务队列
+    enable_dynamic_loop: bool = False       # 阶段二：智能循环终止
+    entity_relation_enabled: bool = False   # 阶段三：知识图谱实体/关系提取
+    semantic_lorebook_enabled: bool = False  # 阶段三：语义向量检索
+    token_arbitration_enabled: bool = False  # 阶段三：Token 预算仲裁
 
     # 路径
     image_folder: str = r"D:\小项目\pixiv下载图片\pixiv下载图片\最终版\pixiv_downloads"
@@ -81,8 +91,12 @@ class ConfigManager:
         self._config = Config()
         self._lock = threading.Lock()
         self._observer: Optional[Observer] = None
+        self._admin_token: str = secrets.token_urlsafe(32)
         self.load_config()
         self._start_watcher()
+
+    def get_admin_token(self) -> str:
+        return self._admin_token
 
     def load_config(self):
         """读取 config.yaml 并更新内部 Config 对象"""
@@ -170,12 +184,18 @@ class ConfigManager:
             "deepseek_api_key": "",
             "deepseek_api_url": "https://api.deepseek.com/chat/completions",
             "deepseek_model_name": "deepseek-v4-flash",
-            "node_chat_url": "http://127.0.0.1:3000/api/chat",
+            "node_chat_url": "http://127.0.0.1:3010/api/chat",
             "node_deepseek_api_key": "",
             "node_model": "deepseek-chat",
             "node_temperature": 0.7,
-            "agent_max_loops": 5,
+            "agent_max_loops": 10,
             "agent_request_timeout": 60.0,
+            "enable_strict_schema": True,
+            "enable_task_queue": False,
+            "enable_dynamic_loop": False,
+            "entity_relation_enabled": False,
+            "semantic_lorebook_enabled": False,
+            "token_arbitration_enabled": False,
             "siliconflow_api_key": "",
             "siliconflow_api_url": "https://api.siliconflow.cn/v1",
             "siliconflow_model_name": "Kwai-Kolors/Kolors",
@@ -231,13 +251,35 @@ class ConfigManager:
 class ConfigAPIHandler(BaseHTTPRequestHandler):
     manager: ConfigManager = None
 
+    def _check_auth(self) -> bool:
+        auth_header = self.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            self.send_response(403)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing or invalid token"}).encode())
+            return False
+        token = auth_header[7:]
+        if not secrets.compare_digest(token, self.manager.get_admin_token()):
+            self.send_response(403)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Invalid token"}).encode())
+            return False
+        return True
+
     def do_GET(self):
         if self.path in ('/', '/index.html'):
-            # 动态读取 web/index.html
+            # 动态读取 web/index.html，注入鉴权 Token
             html_path = Path(__file__).parent / "web" / "index.html"
             try:
                 with open(html_path, 'r', encoding='utf-8') as f:
                     html_content = f.read()
+                token = self.manager.get_admin_token()
+                html_content = html_content.replace(
+                    '</head>',
+                    f'<meta name="admin-token" content="{token}"></head>'
+                )
                 self.send_response(200)
                 self.send_header('Content-type', 'text/html; charset=utf-8')
                 self.end_headers()
@@ -245,6 +287,8 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self.send_error(404, "index.html not found. Please create web/index.html")
         elif self.path == '/api/config':
+            if not self._check_auth():
+                return
             config_data = {}
             with self.manager._lock:
                 for name, field_info in Config.model_fields.items():
@@ -264,6 +308,8 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != '/api/config':
             self.send_error(404)
+            return
+        if not self._check_auth():
             return
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)

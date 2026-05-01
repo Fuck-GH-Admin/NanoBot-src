@@ -398,9 +398,19 @@
 
 <script>
 (function() {
+    // ---------- 阅后即焚：提取并销毁 Token ----------
+    const metaEl = document.querySelector('meta[name="admin-token"]');
+    const ADMIN_TOKEN = metaEl ? metaEl.content : '';
+    if (metaEl) metaEl.remove();
+
     // ---------- 工具函数 ----------
     const $ = (sel) => document.querySelector(sel);
     const $$ = (sel) => document.querySelectorAll(sel);
+
+    function apiFetch(url, options = {}) {
+        const headers = { ...(options.headers || {}), 'Authorization': `Bearer ${ADMIN_TOKEN}` };
+        return fetch(url, { ...options, headers });
+    }
 
     // 状态
     let groupConfigs = {}; // { gid: { random_reply_prob, record_all_messages, allow_r18, allowed_tools } }
@@ -409,7 +419,7 @@
     // ---------- 初始化加载配置 ----------
     async function loadConfig() {
         try {
-            const res = await fetch('/api/config');
+            const res = await apiFetch('/api/config');
             if (!res.ok) throw new Error('HTTP ' + res.status);
             currentConfig = await res.json();
             populateGlobalForm(currentConfig);
@@ -640,7 +650,7 @@
         const payload = { ...globalData, group_configs: groupsData };
 
         try {
-            const res = await fetch('/api/config', {
+            const res = await apiFetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)

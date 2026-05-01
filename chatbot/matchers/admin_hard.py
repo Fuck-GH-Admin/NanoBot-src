@@ -1,7 +1,6 @@
 # src/plugins/chatbot/matchers/admin_hard.py
 
 import re
-import random
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
 from nonebot.params import EventPlainText

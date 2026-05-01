@@ -44,6 +44,21 @@ class ToolRegistry:
                     }
                 }
                 schemas.append(schema)
+
+        # system 工具始终注入（不受权限控制）
+        for tool in self._tools.values():
+            if tool.require_permission == "system":
+                already = any(s["function"]["name"] == tool.name for s in schemas)
+                if not already:
+                    schemas.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                            "require_permission": tool.require_permission
+                        }
+                    })
         return schemas
 
     async def execute_tool(self, name: str, arguments: Dict, context: Dict) -> Tuple[str, List[str]]:
@@ -51,9 +66,11 @@ class ToolRegistry:
         if not tool:
             return f"错误：未知工具 '{name}'", []
 
-        # 权限二次验证
+        # 权限二次验证（system 工具跳过）
         required_perm = tool.require_permission
-        if required_perm == "admin" and not context.get("is_admin"):
+        if required_perm == "system":
+            pass  # 系统工具无需权限检查
+        elif required_perm == "admin" and not context.get("is_admin"):
             return "权限不足：只有管理员可以执行此操作。", []
         elif required_perm == "drawing_whitelist":
             perm_srv = context.get("permission_service")

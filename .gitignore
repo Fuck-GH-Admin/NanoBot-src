@@ -64,6 +64,10 @@ logs/
 #自定义
 # 忽略整个目录
 packed_for_ai1/
+packed_for_ai/
+
 
 # 忽略指定文件
 合并.py
+合并-按文件夹.py
+合并-总文件.py

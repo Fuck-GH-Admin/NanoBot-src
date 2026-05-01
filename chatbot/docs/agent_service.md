@@ -1,48 +1,76 @@
 # AgentService
 
-**文件路径：** `plugins/chatbot/services/agent_service.py`
+**File:** `plugins/chatbot/services/agent_service.py`
 
-**模块职责：** 瘦终端 Agent。只负责与 Node.js 大脑交互完成 ReAct 循环，所有意图分析和对话智慧由远端大模型提供。
-
----
-
-## 核心类与接口
-
-### `AgentService`
-
-| 方法 | 说明 |
-|------|------|
-| `run_agent` | 主入口：加载历史 → 构建工具 Schema → 与 Node 对话 → 执行工具调用 → 返回结果 |
+**Responsibility:** ReAct loop orchestrator. Manages the conversation cycle between Python (state, tools, persistence) and Node.js (prompt compilation, LLM invocation).
 
 ---
 
-### `async def run_agent(user_id: str, text: str, context: Dict[str, Any]) -> Dict[str, Any]`
+## Class: `AgentService`
 
-**参数说明：**
-- `user_id` — 用户 QQ 号，用于加载历史记忆
-- `text` — 用户输入的文本
-- `context` — 上下文字典，必须包含：
-  - `permission_service` — PermissionService 实例
-  - `is_admin: bool` — 用户是否为管理员
-  - `group_id: int` — 群号（私聊为 0）
-  - `allow_r18: bool` — 是否允许 R18
-  - `bot` — NoneBot Bot 实例
-  - `drawing_service` (可选) — DrawingService 实例
-  - `image_service` (可选) — ImageService 实例
-  - `book_service` (可选) — BookService 实例
+| Method | Description |
+|---|---|
+| `run_agent(user_id, text, context)` | Main entry: prepare context → call Node.js → execute tools → return result |
+| `close()` | Cleanup HTTP connection pool on shutdown |
 
-**返回值：**
+### `__init__`
+
+Creates instance-level resources:
+- `self.repo` — `MemoryRepository` singleton
+- `self.memory_service` — `MemoryService` for background compression
+- `self.http_client` — `httpx.AsyncClient` (persistent connection pool, timeout from config)
+- `self.registry` — `ToolRegistry` with all tools pre-registered
+
+---
+
+### `async def run_agent(user_id, text, context) -> Dict[str, Any]`
+
+**Parameters:**
+- `user_id` — QQ number (string)
+- `text` — User message text
+- `context` — Must contain:
+  - `permission_service` — PermissionService instance
+  - `is_admin: bool`
+  - `group_id: int` (0 for private chat)
+  - `allow_r18: bool`
+  - `bot` — NoneBot Bot instance
+  - `sender_name: str`
+  - `drawing_service`, `image_service`, `book_service` (optional)
+
+**Returns:**
 ```python
-{
-    "text": str,       # 最终回复文本
-    "images": [str]    # 图片路径列表
-}
+{"text": str, "images": [str]}
 ```
-- 失败：`{"text": "大脑短路了...", "images": []}`
 
-**调用示例：**
+**Flow:**
+1. Build `session_id` from `group_id` / `user_id`
+2. Insert user message into `chat_history` (single `add_message` call)
+3. Fetch recent messages (limit 30), active profiles, group summary
+4. Build `lorebook_context = {group_id, active_uids}`
+5. ReAct loop (max 5 iterations):
+   - POST to Node.js `/api/chat`
+   - If `tool_calls` returned: execute tools, append results, continue loop
+   - If no tool_calls: fire-and-forget `memory_service.process_session_memory()`, return response
+6. If loop exhausted: return last assistant message
+
+---
+
+## Registered Tools
+
+| Tool Class | Permission | Description |
+|---|---|---|
+| `GenerateImageTool` | `drawing_whitelist` | AI image generation |
+| `SearchAcgImageTool` | `user` | ACG image search |
+| `BanUserTool` | `admin` | Group mute |
+| `RecommendBookTool` | `user` | Book recommendations |
+| `JmDownloadTool` | `drawing_whitelist` | JM comic download |
+
+---
+
+## Example
+
 ```python
-result = await agent_service.run_agent(
+result = await agent.run_agent(
     user_id="123456",
     text="给我画一只猫",
     context={
@@ -51,24 +79,8 @@ result = await agent_service.run_agent(
         "group_id": 12345678,
         "allow_r18": False,
         "bot": bot_instance,
-        "drawing_service": drawing_srv,
-        "image_service": image_srv,
-        "book_service": book_srv,
+        "sender_name": "Alice",
     }
 )
 print(result["text"])
-for img in result["images"]:
-    print(img)
 ```
-
----
-
-### 已注册工具
-
-| 工具类 | 说明 |
-|--------|------|
-| `GenerateImageTool` | AI 绘图工具 |
-| `SearchAcgImageTool` | ACG 图片搜索工具 |
-| `BanUserTool` | 禁言工具 |
-| `RecommendBookTool` | 书籍推荐工具 |
-| `JmDownloadTool` | JM 下载工具 |

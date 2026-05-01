@@ -1,70 +1,106 @@
 # MemoryRepository
 
-**文件路径：** `plugins/chatbot/repositories/memory_repo.py`
+**File:** `plugins/chatbot/repositories/memory_repo.py`
 
-**模块职责：** 用户记忆仓库。负责 `user_{id}.json` 的读写，包含细粒度的用户级并发锁。
+**Responsibility:** Async CRUD operations for all three memory tables. Singleton pattern with SQLAlchemy 2.0 + aiosqlite.
 
----
-
-## 核心类与接口
-
-### `MemoryRepository`（单例）
-
-| 方法 | 说明 |
-|------|------|
-| `load_memory` | 加载用户记忆 |
-| `save_memory` | 保存用户记忆 |
-| `clear_history` | 仅清空历史记录，保留画像 |
+> **Deprecated:** All `user_{id}.json` file-based storage has been removed. This module now operates entirely on SQLite.
 
 ---
 
-### `async def load_memory(user_id: str) -> Dict[str, Any]`
+## Initialization
 
-**参数说明：**
-- `user_id` — 用户 QQ 号
+```python
+repo = MemoryRepository()       # Singleton
+await repo.init_db()            # Creates tables if not exist (call once at startup)
+```
 
-**返回值：**
+Default database: `data/chatbot_memory.db` (auto-created).
+
+---
+
+## ChatHistory Operations
+
+### `async def add_message(session_id, role, content, user_id=None, name=None, timestamp=None, tool_calls=None) -> int`
+
+Insert a single message row. Returns the auto-increment `id`.
+
+```python
+msg_id = await repo.add_message(
+    session_id="group_12345678",
+    role="user",
+    content="hello",
+    user_id="987654321",
+    name="Alice",
+)
+```
+
+### `async def get_recent_messages(session_id, limit=50) -> List[Dict]`
+
+Returns the most recent N messages, ordered by `id ASC` (old → new).
+
+### `async def get_unsummarized_messages(session_id) -> List[Dict]`
+
+Returns all messages where `is_summarized = False`. Used by the memory compression agent.
+
+### `async def mark_messages_summarized(message_ids: List[int]) -> int`
+
+Bulk-update `is_summarized = True`. Returns row count.
+
+---
+
+## GroupMemory Operations
+
+### `async def upsert_group_summary(session_id, summary) -> None`
+
+Insert or update the group's macro summary. Uses `session_id` as primary key.
+
+### `async def get_group_summary(session_id) -> str`
+
+Returns the summary string, or `""` if none exists.
+
+---
+
+## UserTrait Operations
+
+### `async def upsert_user_traits(session_id, user_id, traits_list) -> int`
+
+Atomic upsert using `INSERT ... ON CONFLICT DO UPDATE`.
+
+**Input format:**
+```python
+traits_list = [
+    {"content": "likes cats", "confidence": 0.9},
+    {"content": "programmer", "confidence": 0.7, "source_msg_id": 42},
+]
+```
+
+On conflict (same `session_id + user_id + content`): updates `confidence` to the higher value and refreshes `updated_at`.
+
+### `async def get_active_profiles(session_id, user_ids) -> Dict[str, List[Dict]]`
+
+Returns structured profiles for active users:
+
 ```python
 {
-    "history": [{"role": "user", "content": "..."}, ...],  # 聊天记录列表
-    "profile": {}                                           # 用户画像字典
+    "123456": [
+        {"content": "likes cats", "confidence": 0.9, "updated_at": "2026-05-01T..."},
+        {"content": "friendly", "confidence": 0.6, "updated_at": "2026-05-01T..."},
+    ]
 }
 ```
 
-**调用示例：**
-```python
-repo = MemoryRepository()
-mem = await repo.load_memory("123456")
-print(mem["history"][-1]["content"])
-```
+### `async def deactivate_user_traits(session_id, user_id, trait_ids=None) -> int`
+
+Soft-delete: sets `is_active = False`. If `trait_ids` is None, deactivates all traits for that user in that session.
 
 ---
 
-### `async def save_memory(user_id: str, history: List[dict], profile: dict) -> bool`
+## Session ID Convention
 
-**参数说明：**
-- `user_id` — 用户 QQ 号
-- `history` — 聊天记录列表
-- `profile` — 用户画像字典
-
-**返回值：**
-- 成功：`True`
-- 失败：`False`
-
-**调用示例：**
-```python
-success = await repo.save_memory("123456", history_list, profile_dict)
+```
+group_{group_id}       →  group chat session
+private_{user_id}      →  private chat session
 ```
 
----
-
-### `async def clear_history(user_id: str) -> bool`
-
-**参数说明：** `user_id` — 用户 QQ 号
-
-**返回值：** 成功 `True` / 失败 `False`
-
-**调用示例：**
-```python
-await repo.clear_history("123456")
-```
+All queries are scoped by `session_id`. No cross-session data leakage.

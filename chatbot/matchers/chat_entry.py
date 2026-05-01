@@ -63,19 +63,15 @@ async def handle_chat(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
         group_cfg = plugin_config.group_configs.get(str(group_id), GroupSettings())
         if group_cfg.record_all_messages:
             session_id = f"group_{group_id}"
-            user_msg = {
-                "role": "user",
-                "user_id": user_id,
-                "name": sender_name,
-                "content": text,
-                "timestamp": datetime.now().isoformat(),
-            }
             try:
-                mem = await memory_repo.load_memory(session_id)
-                history = mem.get("history", [])
-                history.append(user_msg)
-                await memory_repo.save_memory(session_id, history, mem.get("profile", {}))
-                logger.debug(f"[ChatEntry] 静默记录群 {group_id} 消息: {user_msg}")
+                await memory_repo.add_message(
+                    session_id=session_id,
+                    role="user",
+                    content=text,
+                    user_id=user_id,
+                    name=sender_name,
+                )
+                logger.debug(f"[ChatEntry] 静默记录群 {group_id} 消息: user={user_id}")
             except Exception as e:
                 logger.warning(f"[ChatEntry] 静默记录失败: {e}")
     else:

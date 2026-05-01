@@ -2,9 +2,24 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const DeepSeekTavernClient = require('./DeepSeekTavernClient');
+const { ChatRequestSchema } = require('./schemas');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
+
+// ========================= 静态配置（非运行时状态） =========================
+const USER_SETTINGS = {
+    username: "User",
+    names_behavior: 0
+};
+
+// ========================= LLM 配置（启动时从环境变量读取一次） =========================
+const LLM_CONFIG = {
+    apiKey: process.env.DEEPSEEK_API_KEY,
+    baseUrl: process.env.DEEPSEEK_BASE_URL,
+    model: process.env.DEEPSEEK_MODEL,
+    temperature: parseFloat(process.env.LLM_TEMPERATURE),
+};
 
 // ========================= 默认配置（容错） =========================
 function getDefaultCharCard() {
@@ -36,7 +51,7 @@ function getDefaultWorldbook() {
     ];
 }
 
-// ========================= 动态加载资源 =========================
+// ========================= 资源加载（返回只读模板） =========================
 function loadAssets() {
     const dataDir = path.resolve(__dirname, '..', 'data');
 
@@ -69,37 +84,54 @@ function loadAssets() {
         worldInfo = getDefaultWorldbook();
     }
 
-    // 3. 创建新的 DeepSeekTavernClient 实例
-    const userSettings = {
-        username: "User",
-        names_behavior: 0
-    };
-    const maxHistoryLength = 15;
-    return new DeepSeekTavernClient(charCard, userSettings, worldInfo, maxHistoryLength);
+    return { charCard, worldInfo };
 }
 
-// ========================= 全局客户端（初始加载） =========================
-let client;
-try {
-    client = loadAssets();
-    console.log('[Server] Initial client created successfully.');
-} catch (err) {
-    console.error('[Server] Fatal error creating initial client:', err);
-    process.exit(1);
-}
+// ========================= 全局只读模板（启动时加载一次） =========================
+let templates = loadAssets();
+console.log('[Server] Templates loaded successfully.');
 
 // ========================= 路由 =========================
 
-// 原有聊天接口
+// 聊天接口（无状态：每次请求创建独立的 Client 实例）
 app.post('/api/chat', async (req, res) => {
     try {
-        const { chatHistory, existingSummary, tools } = req.body;
+        // ----- Schema 校验 -----
+        const parsed = ChatRequestSchema.safeParse(req.body);
+        if (!parsed.success) {
+            return res.status(400).json({
+                error: 'Schema validation failed',
+                details: parsed.error.issues
+            });
+        }
+        const { chatHistory, memorySnapshot, tools, context } = parsed.data;
+
+        // 从只读模板即时创建独立实例，请求结束即被 GC 回收
+        const client = new DeepSeekTavernClient(
+            templates.charCard,
+            USER_SETTINGS,
+            templates.worldInfo,
+            LLM_CONFIG
+        );
+
+        // 将 memorySnapshot.profiles 转换为 DeepSeekTavernClient 期望的 {uid: "traits"} 格式
+        const userProfiles = {};
+        for (const p of memorySnapshot.profiles || []) {
+            if (p.user_id && p.traits && p.traits.length > 0) {
+                userProfiles[p.user_id] = p.traits.map(t => t.content).join('; ');
+            }
+        }
+
         const result = await client.ask(
             chatHistory,
-            existingSummary || "",
+            memorySnapshot.summary || "",
             4000,
-            tools || []
+            tools || [],
+            userProfiles,
+            context || {},
+            memorySnapshot.relations || []
         );
+
         res.json(result);
     } catch (error) {
         console.error('[Server Error] /api/chat:', error);
@@ -107,12 +139,12 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-// 新增热重载接口
+// 热重载接口（仅更新只读模板，无实例需要销毁）
 app.post('/api/reload', async (req, res) => {
     try {
-        client = loadAssets();
-        console.log('[Server] Assets reloaded successfully.');
-        res.json({ status: "success", message: "Assets reloaded" });
+        templates = loadAssets();
+        console.log('[Server] Templates reloaded successfully.');
+        res.json({ status: "success", message: "Templates reloaded" });
     } catch (error) {
         console.error('[Server Error] /api/reload:', error);
         res.status(500).json({ status: "error", message: error.message });
@@ -122,5 +154,5 @@ app.post('/api/reload', async (req, res) => {
 // ========================= 启动 =========================
 const PORT = process.env.NODE_PORT || 3010;
 app.listen(PORT, () => {
-    console.log(`TavernCore Server running on port ${PORT}`);
+    console.log(`TavernCore Server running on port ${PORT} (stateless mode)`);
 });
