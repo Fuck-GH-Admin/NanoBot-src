@@ -54,15 +54,22 @@ class BookRepository:
 
     def find_book_by_id_or_name(self, keyword: str) -> Optional[Path]:
         """
-        尝试在本地查找包含特定 ID 或关键词的书籍
+        尝试在本地查找包含特定 ID 或关键词的书籍，优先返回 PDF。
         """
         books = self.get_all_books()
         keyword = str(keyword).lower()
+
+        matched_pdf = None
+        matched_other = None
         for b in books:
-            # 匹配文件名 (包含ID或名称)
             if keyword in b.name.lower():
-                return b
-        return None
+                if b.suffix.lower() == '.pdf':
+                    if matched_pdf is None:
+                        matched_pdf = b
+                else:
+                    if matched_other is None:
+                        matched_other = b
+        return matched_pdf or matched_other
 
     # --- 路径生成逻辑 (统一由 Repo 管理) ---
 

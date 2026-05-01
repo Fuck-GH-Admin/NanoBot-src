@@ -15,6 +15,10 @@ class RecommendBookTool(BaseTool):
     require_permission = "user"
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
+        # R18 权限阻断
+        if not context.get("allow_r18"):
+            return "❌ 本群未开启 R18 访问权限，已拦截此操作。", []
+
         # 获取书籍服务
         book_srv = context.get("book_service")
         if not book_srv:
@@ -70,6 +74,10 @@ class JmDownloadTool(BaseTool):
     require_permission = "user"
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
+        # R18 权限阻断
+        if not context.get("allow_r18"):
+            return "❌ 本群未开启 R18 访问权限，已拦截此操作。", []
+
         ids = arguments.get("ids", [])
         if not ids:
             return "请提供要下载的本子ID", []

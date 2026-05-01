@@ -60,3 +60,10 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+
+#自定义
+# 忽略整个目录
+packed_for_ai1/
+
+# 忽略指定文件
+合并.py

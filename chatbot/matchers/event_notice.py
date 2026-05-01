@@ -8,8 +8,16 @@ from nonebot.adapters.onebot.v11 import Bot, PokeNotifyEvent, GroupIncreaseNotic
 from nonebot.log import logger
 
 from ..config import plugin_config
-from ..consts import POKE_REPLIES
 from ..services import img_srv, agent_srv
+
+# 戳一戳随机回复语料池
+POKE_REPLIES = [
+    "戳我干嘛？",
+    "别戳啦！痒死了QAQ",
+    "戳我也没用，我不会给你发图的！",  # 触发发图
+    "你再戳我就把你禁言一分钟哦～",    # 触发警告
+    "好痒！停下！我要叫主人了！"       # 触发叫主人
+]
 
 # ---------- 戳一戳 ----------
 poke = on_notice(priority=5, block=True)

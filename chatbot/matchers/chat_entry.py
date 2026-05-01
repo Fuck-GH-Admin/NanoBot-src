@@ -48,7 +48,8 @@ async def handle_chat(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
     text = text.strip()
     if not text:
         if is_group:
-            await chat_entry.finish("🤔 发空气干嘛？")
+            # 群聊遇到纯表情/空文本直接忽略
+            await chat_entry.finish()
         else:
             await chat_entry.finish("嗯？")
         return

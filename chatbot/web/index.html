@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chatbot 控制面板</title>
+    <style>
+        :root {
+            --bg: #f5f7fa;
+            --surface: #ffffff;
+            --text: #1f2937;
+            --text-secondary: #6b7280;
+            --border: #e5e7eb;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --success: #10b981;
+            --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+            --radius: 12px;
+        }
+        body {
+            margin: 0;
+            padding: 2rem;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            line-height: 1.5;
+        }
+        .container {
+            max-width: 980px;
+            margin: 0 auto;
+        }
+        h1 {
+            margin: 0 0 1.5rem;
+            font-weight: 600;
+            font-size: 1.8rem;
+        }
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 0.25rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1.5rem;
+        }
+        .tab-btn {
+            padding: 0.75rem 1.5rem;
+            background: transparent;
+            border: none;
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: 0.2s;
+        }
+        .tab-btn.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+        .tab-panel {
+            display: none;
+        }
+        .tab-panel.active {
+            display: block;
+        }
+        /* Cards */
+        .card {
+            background: var(--surface);
+            border-radius: var(--radius);
+            padding: 1.5rem;
+            margin-bottom: 1.25rem;
+            box-shadow: var(--shadow);
+        }
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .card-header h2 {
+            margin: 0;
+            font-size: 1.2rem;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 1.25rem;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+        .form-group label {
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+        input, select, textarea {
+            padding: 0.6rem 0.8rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.9rem;
+            background: var(--surface);
+            color: var(--text);
+            transition: border-color 0.2s;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(59,130,246,0.15);
+        }
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .slider-row input[type="range"] {
+            flex: 1;
+        }
+        .slider-value {
+            min-width: 3.5rem;
+            text-align: right;
+            font-weight: 500;
+        }
+        /* Toggle switch */
+        .toggle-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+        }
+        .toggle {
+            position: relative;
+            width: 44px;
+            height: 24px;
+            background: var(--border);
+            border-radius: 12px;
+            transition: background 0.2s;
+        }
+        .toggle::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 20px;
+            height: 20px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.2s;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+        }
+        .toggle-checkbox:checked + .toggle {
+            background: var(--accent);
+        }
+        .toggle-checkbox:checked + .toggle::after {
+            transform: translateX(20px);
+        }
+        .toggle-checkbox.r18:checked + .toggle {
+            background: var(--danger);
+        }
+        /* Checkbox group */
+        .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-top: 0.25rem;
+        }
+        .checkbox-group label {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-weight: 400;
+            color: var(--text);
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        .btn {
+            padding: 0.6rem 1.2rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-danger {
+            background: transparent;
+            color: var(--danger);
+            border: 1px solid var(--danger);
+        }
+        .btn-danger:hover {
+            background: var(--danger);
+            color: white;
+        }
+        .btn-success {
+            background: var(--success);
+            color: white;
+            font-size: 1rem;
+            padding: 0.75rem 2rem;
+        }
+        .btn-success:hover { opacity: 0.9; }
+        .btn-add {
+            margin: 1rem 0 1.5rem;
+            font-weight: 600;
+        }
+        .group-card {
+            position: relative;
+            padding: 1.2rem;
+            margin-bottom: 1rem;
+            background: var(--surface);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            border-left: 4px solid var(--accent);
+        }
+        .group-card .card-header {
+            margin-bottom: 0.75rem;
+        }
+        .group-card .delete-btn {
+            position: absolute;
+            top: 0.75rem;
+            right: 0.75rem;
+            background: none;
+            border: none;
+            color: var(--danger);
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            transition: 0.2s;
+        }
+        .group-card .delete-btn:hover {
+            background: rgba(239,68,68,0.1);
+        }
+        .save-section {
+            margin-top: 2rem;
+            display: flex;
+            justify-content: flex-end;
+        }
+        .status-msg {
+            margin-left: 1rem;
+            font-size: 0.9rem;
+            align-self: center;
+            color: var(--text-secondary);
+        }
+        .status-msg.error { color: var(--danger); }
+        .status-msg.success { color: var(--success); }
+        hr {
+            border: 0.5px solid var(--border);
+            margin: 1.5rem 0;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>⚙️ Chatbot 控制面板</h1>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <button class="tab-btn active" data-tab="global">🌐 全局设置</button>
+        <button class="tab-btn" data-tab="groups">👥 群组管理</button>
+    </div>
+
+    <!-- 全局设置面板 -->
+    <div id="tab-global" class="tab-panel active">
+        <div class="card">
+            <h2>API 密钥与端点</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>DeepSeek API Key</label>
+                    <input type="password" id="deepseek_api_key" placeholder="sk-...">
+                </div>
+                <div class="form-group">
+                    <label>DeepSeek API URL</label>
+                    <input type="text" id="deepseek_api_url">
+                </div>
+                <div class="form-group">
+                    <label>DeepSeek 模型</label>
+                    <input type="text" id="deepseek_model_name">
+                </div>
+                <div class="form-group">
+                    <label>SiliconFlow API Key</label>
+                    <input type="password" id="siliconflow_api_key" placeholder="sk-...">
+                </div>
+                <div class="form-group">
+                    <label>SiliconFlow API URL</label>
+                    <input type="text" id="siliconflow_api_url">
+                </div>
+                <div class="form-group">
+                    <label>SiliconFlow 模型</label>
+                    <input type="text" id="siliconflow_model_name">
+                </div>
+                <div class="form-group">
+                    <label>Node.js 引擎地址</label>
+                    <input type="text" id="node_chat_url">
+                </div>
+                <div class="form-group">
+                    <label>Node 端 DeepSeek Key</label>
+                    <input type="password" id="node_deepseek_api_key" placeholder="sk-...">
+                </div>
+                <div class="form-group">
+                    <label>Node 模型</label>
+                    <input type="text" id="node_model">
+                </div>
+                <div class="form-group">
+                    <label>Node 温度 (0~2)</label>
+                    <input type="range" min="0" max="2" step="0.1" id="node_temperature" style="width:100%">
+                    <span id="node_temperature_val" style="font-size:0.85rem; text-align:right;">0.7</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Agent 行为</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>最大工具循环次数</label>
+                    <input type="number" id="agent_max_loops" min="1" max="10">
+                </div>
+                <div class="form-group">
+                    <label>请求超时 (秒)</label>
+                    <input type="number" id="agent_request_timeout" step="0.5" min="5">
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>文件路径</h2>
+            <div class="form-grid">
+                <div class="form-group"><label>图片目录</label><input type="text" id="image_folder"></div>
+                <div class="form-group"><label>书籍目录</label><input type="text" id="books_folder"></div>
+                <div class="form-group"><label>Excel 数据文件</label><input type="text" id="excel_path"></div>
+                <div class="form-group"><label>JM 临时目录</label><input type="text" id="jm_download_dir"></div>
+                <div class="form-group"><label>JM 配置文件</label><input type="text" id="jm_option_path"></div>
+                <div class="form-group"><label>字体路径</label><input type="text" id="font_path"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>权限与白名单</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>Superusers (逗号分隔)</label>
+                    <input type="text" id="superusers" placeholder="2797364016,10001">
+                </div>
+                <div class="form-group">
+                    <label>私聊白名单</label>
+                    <input type="text" id="private_whitelist" placeholder="QQ号...">
+                </div>
+                <div class="form-group">
+                    <label>AI 管理员</label>
+                    <input type="text" id="ai_admin_qq" placeholder="QQ号...">
+                </div>
+                <div class="form-group">
+                    <label>绘图白名单</label>
+                    <input type="text" id="drawing_whitelist" placeholder="QQ号...">
+                </div>
+                <div class="form-group">
+                    <label>欢迎功能生效群号</label>
+                    <input type="text" id="welcome_groups" placeholder="群号,逗号分隔">
+                </div>
+                <div class="form-group">
+                    <label>欢迎模式</label>
+                    <select id="welcome_mode">
+                        <option value="all">全部</option>
+                        <option value="hello">仅欢迎</option>
+                        <option value="bye">仅欢送</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 群组管理面板 -->
+    <div id="tab-groups" class="tab-panel">
+        <button class="btn btn-primary btn-add" id="add-group-btn">➕ 新增群配置</button>
+        <div id="groups-container">
+            <!-- 动态插入群组卡片 -->
+        </div>
+        <div id="no-groups-msg" style="color:var(--text-secondary); padding:1rem;">暂无群组配置，点击上方按钮添加。</div>
+    </div>
+
+    <!-- 保存栏 -->
+    <div class="save-section">
+        <button class="btn btn-success" id="save-btn">💾 保存配置</button>
+        <span class="status-msg" id="status-msg"></span>
+    </div>
+</div>
+
+<script>
+(function() {
+    // ---------- 工具函数 ----------
+    const $ = (sel) => document.querySelector(sel);
+    const $$ = (sel) => document.querySelectorAll(sel);
+
+    // 状态
+    let groupConfigs = {}; // { gid: { random_reply_prob, record_all_messages, allow_r18, allowed_tools } }
+    let currentConfig = null; // 完整配置对象
+
+    // ---------- 初始化加载配置 ----------
+    async function loadConfig() {
+        try {
+            const res = await fetch('/api/config');
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            currentConfig = await res.json();
+            populateGlobalForm(currentConfig);
+            groupConfigs = currentConfig.group_configs || {};
+            renderGroupCards();
+        } catch (e) {
+            showStatus('加载配置失败: ' + e.message, true);
+        }
+    }
+
+    // ---------- 填充全局表单 ----------
+    function populateGlobalForm(cfg) {
+        // 字符串/数字字段
+        const textFields = [
+            'deepseek_api_key', 'deepseek_api_url', 'deepseek_model_name',
+            'siliconflow_api_key', 'siliconflow_api_url', 'siliconflow_model_name',
+            'node_chat_url', 'node_deepseek_api_key', 'node_model',
+            'image_folder', 'books_folder', 'excel_path',
+            'jm_download_dir', 'jm_option_path', 'font_path',
+            'welcome_mode'
+        ];
+        textFields.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.value = cfg[id] !== undefined ? cfg[id] : '';
+        });
+
+        // 数字字段
+        $('#agent_max_loops').value = cfg.agent_max_loops || 5;
+        $('#agent_request_timeout').value = cfg.agent_request_timeout || 60;
+
+        // 滑动条
+        const tempSlider = $('#node_temperature');
+        tempSlider.value = cfg.node_temperature !== undefined ? cfg.node_temperature : 0.7;
+        $('#node_temperature_val').textContent = parseFloat(tempSlider.value).toFixed(1);
+        tempSlider.addEventListener('input', () => {
+            $('#node_temperature_val').textContent = parseFloat(tempSlider.value).toFixed(1);
+        });
+
+        // Set 字段（以逗号分隔显示）
+        const setFields = ['superusers', 'private_whitelist', 'ai_admin_qq', 'drawing_whitelist', 'welcome_groups'];
+        setFields.forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            let val = cfg[id];
+            if (Array.isArray(val)) {
+                el.value = val.join(',');
+            } else if (typeof val === 'string') {
+                el.value = val;
+            } else {
+                el.value = '';
+            }
+        });
+    }
+
+    // ---------- 收集全局表单数据 ----------
+    function collectGlobalData() {
+        const data = {};
+        // 文本字段
+        const textFields = [
+            'deepseek_api_key', 'deepseek_api_url', 'deepseek_model_name',
+            'siliconflow_api_key', 'siliconflow_api_url', 'siliconflow_model_name',
+            'node_chat_url', 'node_deepseek_api_key', 'node_model',
+            'image_folder', 'books_folder', 'excel_path',
+            'jm_download_dir', 'jm_option_path', 'font_path',
+            'welcome_mode'
+        ];
+        textFields.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) data[id] = el.value;
+        });
+
+        // 数字（isNaN 守卫避免 0 被 || 吞掉）
+        const loops = parseInt($('#agent_max_loops').value);
+        data.agent_max_loops = isNaN(loops) ? 5 : loops;
+
+        const timeout = parseFloat($('#agent_request_timeout').value);
+        data.agent_request_timeout = isNaN(timeout) ? 60 : timeout;
+
+        const temp = parseFloat($('#node_temperature').value);
+        data.node_temperature = isNaN(temp) ? 0.7 : temp;
+
+        // Set 字段 -> 逗号分隔字符串或数组？后端可以处理逗号分隔字符串，但我们发送数组更可靠
+        const setFields = ['superusers', 'private_whitelist', 'ai_admin_qq', 'drawing_whitelist', 'welcome_groups'];
+        setFields.forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const raw = el.value.trim();
+            if (raw === '') {
+                data[id] = [];
+            } else {
+                data[id] = raw.split(',').map(s => s.trim()).filter(s => s);
+            }
+        });
+        return data;
+    }
+
+    // ---------- 渲染群组卡片 ----------
+    function renderGroupCards() {
+        const container = $('#groups-container');
+        const noMsg = $('#no-groups-msg');
+        container.innerHTML = '';
+        const gids = Object.keys(groupConfigs);
+        if (gids.length === 0) {
+            noMsg.style.display = 'block';
+            return;
+        }
+        noMsg.style.display = 'none';
+
+        gids.forEach(gid => {
+            const cfg = groupConfigs[gid];
+            const card = document.createElement('div');
+            card.className = 'group-card';
+            card.dataset.gid = gid;
+            card.innerHTML = `
+                <button class="delete-btn" title="删除该群配置">❌</button>
+                <div class="card-header">
+                    <h3>群组：<span class="gid-display">${escapeHtml(gid)}</span></h3>
+                </div>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>随机插嘴概率</label>
+                        <div class="slider-row">
+                            <input type="range" min="0" max="1" step="0.01" value="${cfg.random_reply_prob ?? 0}" class="prob-slider">
+                            <span class="slider-value prob-value">${(cfg.random_reply_prob ?? 0).toFixed(2)}</span>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>潜水记录</label>
+                        <label class="toggle-label">
+                            <input type="checkbox" class="toggle-checkbox record-check" ${cfg.record_all_messages ? 'checked' : ''}>
+                            <div class="toggle"></div>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>允许 R18</label>
+                        <label class="toggle-label">
+                            <input type="checkbox" class="toggle-checkbox r18 r18-check" ${cfg.allow_r18 ? 'checked' : ''}>
+                            <div class="toggle"></div>
+                        </label>
+                    </div>
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>允许的工具</label>
+                        <div class="checkbox-group tools-checkbox-group">
+                            ${renderToolsCheckboxes(cfg.allowed_tools || [])}
+                        </div>
+                    </div>
+                </div>
+            `;
+            // 绑定滑动条更新
+            const slider = card.querySelector('.prob-slider');
+            const valSpan = card.querySelector('.prob-value');
+            slider.addEventListener('input', () => {
+                valSpan.textContent = parseFloat(slider.value).toFixed(2);
+            });
+
+            // 删除按钮
+            card.querySelector('.delete-btn').addEventListener('click', () => {
+                if (confirm(`确定删除群组 ${gid} 的配置吗？`)) {
+                    delete groupConfigs[gid];
+                    renderGroupCards();
+                }
+            });
+
+            container.appendChild(card);
+        });
+    }
+
+    function renderToolsCheckboxes(selectedTools) {
+        const allTools = ['search_acg_image', 'recommend_book', 'generate_image', 'ban_user', 'jm_download'];
+        const selectedSet = new Set(selectedTools);
+        return allTools.map(tool => {
+            const checked = selectedSet.has(tool) ? 'checked' : '';
+            return `<label><input type="checkbox" value="${tool}" class="tool-check" ${checked}> ${tool.replace(/_/g, ' ')}</label>`;
+        }).join('');
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.innerText = text;
+        return div.innerHTML;
+    }
+
+    // ---------- 收集群组配置 ----------
+    function collectGroupConfigs() {
+        const result = {};
+        const cards = $$('.group-card');
+        cards.forEach(card => {
+            const gid = card.dataset.gid;
+            const prob = parseFloat(card.querySelector('.prob-slider').value) || 0;
+            const record = card.querySelector('.record-check').checked;
+            const r18 = card.querySelector('.r18-check').checked;
+            const toolChecks = card.querySelectorAll('.tool-check:checked');
+            const tools = Array.from(toolChecks).map(cb => cb.value);
+            result[gid] = {
+                random_reply_prob: prob,
+                record_all_messages: record,
+                allow_r18: r18,
+                allowed_tools: tools
+            };
+        });
+        return result;
+    }
+
+    // ---------- 新增群组 ----------
+    $('#add-group-btn').addEventListener('click', () => {
+        const gid = prompt('请输入新的群号 (纯数字)：');
+        if (!gid || !/^\d+$/.test(gid)) {
+            alert('请输入有效的群号（数字）');
+            return;
+        }
+        if (groupConfigs[gid]) {
+            alert('该群组配置已存在！');
+            return;
+        }
+        groupConfigs[gid] = {
+            random_reply_prob: 0.05,
+            record_all_messages: true,
+            allow_r18: false,
+            allowed_tools: ['search_acg_image', 'recommend_book']
+        };
+        renderGroupCards();
+    });
+
+    // ---------- 保存配置 ----------
+    $('#save-btn').addEventListener('click', async () => {
+        const globalData = collectGlobalData();
+        const groupsData = collectGroupConfigs();
+        const payload = { ...globalData, group_configs: groupsData };
+
+        try {
+            const res = await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.error || 'HTTP ' + res.status);
+            }
+            showStatus('配置已保存成功！', false);
+            // 重新加载以同步后端可能做的规范化
+            await loadConfig();
+        } catch (e) {
+            showStatus('保存失败: ' + e.message, true);
+        }
+    });
+
+    function showStatus(msg, isError) {
+        const el = $('#status-msg');
+        el.textContent = msg;
+        el.className = 'status-msg ' + (isError ? 'error' : 'success');
+        setTimeout(() => {
+            el.textContent = '';
+            el.className = 'status-msg';
+        }, 5000);
+    }
+
+    // ---------- Tab 切换 ----------
+    const tabBtns = $$('.tab-btn');
+    const panels = $$('.tab-panel');
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const target = btn.dataset.tab;
+            tabBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            panels.forEach(p => p.classList.remove('active'));
+            document.getElementById('tab-' + target).classList.add('active');
+        });
+    });
+
+    // 启动
+    loadConfig();
+})();
+</script>
+</body>
+</html>

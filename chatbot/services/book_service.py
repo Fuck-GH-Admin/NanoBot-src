@@ -138,7 +138,6 @@ class BookService:
             source_path = item['path']
 
             # --- Step 1: 确保是 PDF ---
-            target_pdf = source_path
             if source_path.suffix.lower() != '.pdf':
                 expected_pdf_path = self.repo.get_pdf_output_path(source_path)
                 if expected_pdf_path.exists():
@@ -154,8 +153,11 @@ class BookService:
                     if result_str and Path(result_str).exists():
                         target_pdf = Path(result_str)
                     else:
-                        logger.warning(f"[JM] 转换失败，将发送原文件: {source_path.name}")
-                        target_pdf = source_path
+                        logger.warning(f"[JM] 转换失败，跳过: {source_path.name}")
+                        failed_ids.append(book_id)
+                        continue
+            else:
+                target_pdf = source_path
 
             # --- Step 2: 注入UUID + 加密 (仅对 PDF) ---
             ready_to_send = target_pdf
