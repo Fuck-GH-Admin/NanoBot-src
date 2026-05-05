@@ -18,8 +18,10 @@
 Creates instance-level resources:
 - `self.repo` — `MemoryRepository` singleton
 - `self.memory_service` — `MemoryService` for background compression
-- `self.http_client` — `httpx.AsyncClient` (persistent connection pool, timeout from config)
+- `self.http_client` — `httpx.AsyncClient` (persistent connection pool, no fixed timeout)
 - `self.registry` — `ToolRegistry` with all tools pre-registered
+
+> **动态超时：** `httpx.AsyncClient` 在初始化时不绑定超时值。每次调用 `run_agent` 中的 `self.http_client.post()` 时，通过 `timeout=plugin_config.agent_request_timeout` 动态传入当前配置的超时时间，确保 YAML 热重载后超时设置立即生效。
 
 ---
 

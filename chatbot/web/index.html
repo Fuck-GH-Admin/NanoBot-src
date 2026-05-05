@@ -300,21 +300,19 @@
                     <input type="text" id="siliconflow_model_name">
                 </div>
                 <div class="form-group">
-                    <label>Node.js 引擎地址</label>
-                    <input type="text" id="node_chat_url">
+                    <label>Embedding 模型</label>
+                    <input type="text" id="embedding_model_name" placeholder="BAAI/bge-m3">
                 </div>
                 <div class="form-group">
-                    <label>Node 端 DeepSeek Key</label>
-                    <input type="password" id="node_deepseek_api_key" placeholder="sk-...">
+                    <label>Reranker 模型</label>
+                    <input type="text" id="reranker_model_name" placeholder="BAAI/bge-reranker-v2-m3">
                 </div>
                 <div class="form-group">
-                    <label>Node 模型</label>
-                    <input type="text" id="node_model">
-                </div>
-                <div class="form-group">
-                    <label>Node 温度 (0~2)</label>
-                    <input type="range" min="0" max="2" step="0.1" id="node_temperature" style="width:100%">
-                    <span id="node_temperature_val" style="font-size:0.85rem; text-align:right;">0.7</span>
+                    <label>启用 Reranker 精排</label>
+                    <label class="toggle-label">
+                        <input type="checkbox" class="toggle-checkbox" id="enable_reranker">
+                        <div class="toggle"></div>
+                    </label>
                 </div>
             </div>
         </div>
@@ -338,7 +336,7 @@
             <div class="form-grid">
                 <div class="form-group"><label>图片目录</label><input type="text" id="image_folder"></div>
                 <div class="form-group"><label>书籍目录</label><input type="text" id="books_folder"></div>
-                <div class="form-group"><label>Excel 数据文件</label><input type="text" id="excel_path"></div>
+                <div class="form-group"><label>Pixiv 数据库</label><input type="text" id="db_path"></div>
                 <div class="form-group"><label>JM 临时目录</label><input type="text" id="jm_download_dir"></div>
                 <div class="form-group"><label>JM 配置文件</label><input type="text" id="jm_option_path"></div>
                 <div class="form-group"><label>字体路径</label><input type="text" id="font_path"></div>
@@ -436,8 +434,8 @@
         const textFields = [
             'deepseek_api_key', 'deepseek_api_url', 'deepseek_model_name',
             'siliconflow_api_key', 'siliconflow_api_url', 'siliconflow_model_name',
-            'node_chat_url', 'node_deepseek_api_key', 'node_model',
-            'image_folder', 'books_folder', 'excel_path',
+            'embedding_model_name', 'reranker_model_name',
+            'image_folder', 'books_folder', 'db_path',
             'jm_download_dir', 'jm_option_path', 'font_path',
             'welcome_mode'
         ];
@@ -450,13 +448,8 @@
         $('#agent_max_loops').value = cfg.agent_max_loops || 5;
         $('#agent_request_timeout').value = cfg.agent_request_timeout || 60;
 
-        // 滑动条
-        const tempSlider = $('#node_temperature');
-        tempSlider.value = cfg.node_temperature !== undefined ? cfg.node_temperature : 0.7;
-        $('#node_temperature_val').textContent = parseFloat(tempSlider.value).toFixed(1);
-        tempSlider.addEventListener('input', () => {
-            $('#node_temperature_val').textContent = parseFloat(tempSlider.value).toFixed(1);
-        });
+        // 开关字段
+        $('#enable_reranker').checked = !!cfg.enable_reranker;
 
         // Set 字段（以逗号分隔显示）
         const setFields = ['superusers', 'private_whitelist', 'ai_admin_qq', 'drawing_whitelist', 'welcome_groups'];
@@ -481,8 +474,8 @@
         const textFields = [
             'deepseek_api_key', 'deepseek_api_url', 'deepseek_model_name',
             'siliconflow_api_key', 'siliconflow_api_url', 'siliconflow_model_name',
-            'node_chat_url', 'node_deepseek_api_key', 'node_model',
-            'image_folder', 'books_folder', 'excel_path',
+            'embedding_model_name', 'reranker_model_name',
+            'image_folder', 'books_folder', 'db_path',
             'jm_download_dir', 'jm_option_path', 'font_path',
             'welcome_mode'
         ];
@@ -491,15 +484,15 @@
             if (el) data[id] = el.value;
         });
 
+        // 开关字段
+        data.enable_reranker = $('#enable_reranker').checked;
+
         // 数字（isNaN 守卫避免 0 被 || 吞掉）
         const loops = parseInt($('#agent_max_loops').value);
         data.agent_max_loops = isNaN(loops) ? 5 : loops;
 
         const timeout = parseFloat($('#agent_request_timeout').value);
         data.agent_request_timeout = isNaN(timeout) ? 60 : timeout;
-
-        const temp = parseFloat($('#node_temperature').value);
-        data.node_temperature = isNaN(temp) ? 0.7 : temp;
 
         // Set 字段 -> 逗号分隔字符串或数组？后端可以处理逗号分隔字符串，但我们发送数组更可靠
         const setFields = ['superusers', 'private_whitelist', 'ai_admin_qq', 'drawing_whitelist', 'welcome_groups'];

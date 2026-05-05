@@ -10,6 +10,8 @@
 
 ### `DrawingService`
 
+> **热更新支持：** 本服务不在 `__init__` 中缓存 API 密钥和端点。`_call_siliconflow` 等方法在每次执行时实时读取 `plugin_config.siliconflow_api_key`、`plugin_config.siliconflow_api_url` 等配置项，确保 YAML 配置热重载后立即生效。
+
 | 方法 | 说明 |
 |------|------|
 | `generate_image` | 生成图片的主入口（权限校验 → Prompt 优化 → API 调用） |

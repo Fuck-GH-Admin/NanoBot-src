@@ -4,11 +4,11 @@ import asyncio
 import json
 import httpx
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, Any
 from nonebot.log import logger
 
 from ..config import plugin_config
-from ..schemas import ChatRequestPayload
+from .prompt_adapter import PromptAdapter
 from ..repositories.memory_repo import MemoryRepository
 from ..tools.registry import ToolRegistry
 from ..tools.image_tool import GenerateImageTool, SearchAcgImageTool
@@ -17,12 +17,22 @@ from ..tools.book_tool import RecommendBookTool, JmDownloadTool
 from ..tools.system_tool import MarkTaskCompleteTool
 from .memory_service import MemoryService
 from ..utils.embedding import create_semantic_lorebook
+from ..utils.alert_manager import send_emergency_alert, reset_cooldown
 
 # 发给 Node.js 的近期消息轮次上限
 RECENT_MESSAGES_LIMIT = 30
 
 # 重复检测相似度阈值
 JACCARD_THRESHOLD = 0.9
+
+# 数据层调用超时（秒）
+DB_QUERY_TIMEOUT = 3.0
+
+# 工具执行超时（秒）
+TOOL_EXEC_TIMEOUT = 15.0
+
+# 语义检索超时（秒）
+SEMANTIC_SEARCH_TIMEOUT = 3.0
 
 
 def _jaccard(a: str, b: str) -> float:
@@ -38,9 +48,9 @@ class AgentService:
     def __init__(self):
         self.repo = MemoryRepository()
         self.memory_service = MemoryService()
-        self.node_url = plugin_config.node_chat_url
+        self.prompt_adapter = PromptAdapter()
         self.registry = ToolRegistry()
-        self.http_client = httpx.AsyncClient(timeout=plugin_config.agent_request_timeout)
+        self.http_client = httpx.AsyncClient()
         self.semantic_lorebook = create_semantic_lorebook(plugin_config)
         self._register_tools()
 
@@ -108,7 +118,7 @@ class AgentService:
         sender_name = context.get("sender_name", "User")
         now_iso = datetime.now().isoformat()
 
-        user_msg_id = await self.repo.add_message(
+        await self.repo.add_message(
             session_id=session_id,
             role="user",
             content=text,
@@ -117,29 +127,56 @@ class AgentService:
             timestamp=now_iso,
         )
 
-        # ---------- 3. 精准备料：从数据库读取近期上下文 ----------
-        # 3a. 最近 N 条消息（作为发给 Node.js 的 chatHistory）
-        recent_msgs = await self.repo.get_recent_messages(
-            session_id, limit=RECENT_MESSAGES_LIMIT
-        )
+        # ---------- 3. 精准备料（含超时降级） ----------
+        # 3a. 最近消息
+        try:
+            recent_msgs = await asyncio.wait_for(
+                self.repo.get_recent_messages(session_id, limit=RECENT_MESSAGES_LIMIT),
+                timeout=DB_QUERY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[Agent] 获取最近消息超时（{DB_QUERY_TIMEOUT}s），降级为空历史")
+            recent_msgs = []
         messages = [self._to_openai_message(m) for m in recent_msgs]
 
-        # 3b. 提取活跃 user_id 集合，精准获取画像
-        active_uids = list({
-            m.get("user_id") for m in recent_msgs if m.get("user_id")
-        })
-        profiles_raw = await self.repo.get_active_profiles(session_id, active_uids)
+        # 3b. 活跃画像
+        try:
+            active_uids = list({
+                m.get("user_id") for m in recent_msgs if m.get("user_id")
+            })
+            profiles_raw = await asyncio.wait_for(
+                self.repo.get_active_profiles(session_id, active_uids),
+                timeout=DB_QUERY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[Agent] 获取活跃画像超时，降级为空画像")
+            profiles_raw = {}
+            active_uids = []
 
-        # 3c. 读取群组宏观摘要
-        existing_summary = await self.repo.get_group_summary(session_id)
+        # 3c. 群组摘要
+        try:
+            existing_summary = await asyncio.wait_for(
+                self.repo.get_group_summary(session_id),
+                timeout=DB_QUERY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[Agent] 获取群组摘要超时，降级为空摘要")
+            existing_summary = ""
 
-        # 3d. 查询活跃实体间的关系图（带衰减）
+        # 3d. 关系图谱（如果启用）
         decayed_relations = []
         if plugin_config.entity_relation_enabled:
-            entity_ids = [f"user_{uid}" for uid in active_uids if uid]
-            decayed_relations = await self.repo.get_relations_with_decay(
-                session_id, entity_ids=entity_ids if entity_ids else None
-            )
+            try:
+                entity_ids = [f"user_{uid}" for uid in active_uids if uid]
+                decayed_relations = await asyncio.wait_for(
+                    self.repo.get_relations_with_decay(
+                        session_id, entity_ids=entity_ids if entity_ids else None
+                    ),
+                    timeout=DB_QUERY_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error("[Agent] 获取关系图谱超时，降级为空关系")
+                decayed_relations = []
 
         # 工具 schema
         perm_srv = context.get("permission_service")
@@ -168,15 +205,25 @@ class AgentService:
                 "token_arbitration_enabled": plugin_config.token_arbitration_enabled,
             }
 
-            # 语义向量检索（降级安全：失败返回空列表）
+            # 语义向量检索（降级安全：超时或失败返回空列表）
             if plugin_config.semantic_lorebook_enabled and self.semantic_lorebook and text:
                 try:
-                    semantic_hits = await self.semantic_lorebook.search(text, top_k=3)
+                    semantic_hits = await asyncio.wait_for(
+                        self.semantic_lorebook.search(text, top_k=3),
+                        timeout=SEMANTIC_SEARCH_TIMEOUT,
+                    )
                     lorebook_context["semantic_hits"] = semantic_hits
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[Agent] 语义检索超时（%ds），降级为纯关键词匹配",
+                        SEMANTIC_SEARCH_TIMEOUT,
+                    )
+                    lorebook_context["semantic_hits"] = []
                 except Exception as e:
                     logger.warning(f"[Agent] 语义检索失败，降级为纯关键词: {e}")
+                    lorebook_context["semantic_hits"] = []
 
-            # 构建 memorySnapshot（符合 ChatRequestPayload schema）
+            # 构建 memorySnapshot
             memory_snapshot = {
                 "summary": existing_summary,
                 "profiles": [
@@ -201,23 +248,44 @@ class AgentService:
                 ],
             }
 
-            # Pydantic 校验：确保发出的 payload 格式正确
-            validated = ChatRequestPayload(
-                chatHistory=messages,
-                memorySnapshot=memory_snapshot,
-                tools=tools,
+            # 使用 PromptAdapter 组装 messages（engine 管线）
+            compiled_messages = self.prompt_adapter.compile_prompt(
+                chat_history=messages,
+                snapshot=memory_snapshot,
                 context=lorebook_context,
             )
-            payload = validated.model_dump()
+
+            # 直连 LLM API
+            api_payload: Dict[str, Any] = {
+                "model": plugin_config.deepseek_model_name,
+                "messages": compiled_messages,
+                "temperature": 0.7,
+                "max_tokens": 2048,
+            }
+            if tools:
+                api_payload["tools"] = tools
 
             try:
-                resp = await self.http_client.post(self.node_url, json=payload)
+                resp = await self.http_client.post(
+                    plugin_config.deepseek_api_url,
+                    json=api_payload,
+                    headers={
+                        "Authorization": f"Bearer {plugin_config.deepseek_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=plugin_config.agent_request_timeout,
+                )
                 if resp.status_code != 200:
-                    logger.error(f"[Agent] Node API error {resp.status_code}: {resp.text}")
+                    logger.error(f"[Agent] LLM API error {resp.status_code}: {resp.text}")
+                    if resp.status_code in (402, 403):
+                        asyncio.create_task(send_emergency_alert(
+                            f"⚠️ API 拒绝访问 ({resp.status_code})，聊天功能不可用，请尽快检查 API 余额或风控状态。"
+                        ))
                     return {"text": "大脑短路了，等一下再试吧...", "images": all_images}
                 data = resp.json()
+                reset_cooldown()
             except Exception as e:
-                logger.error(f"[Agent] 请求 Node 失败: {e}")
+                logger.error(f"[Agent] 请求 LLM 失败: {e}")
                 return {"text": "连接至思考中心失败，请稍后重试。", "images": all_images}
 
             choices = data.get("choices", [])
@@ -274,7 +342,15 @@ class AgentService:
                 except json.JSONDecodeError:
                     arguments = {}
 
-                result_text, images = await self.registry.execute_tool(func_name, arguments, context)
+                try:
+                    result_text, images = await asyncio.wait_for(
+                        self.registry.execute_tool(func_name, arguments, context),
+                        timeout=TOOL_EXEC_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[Agent] 工具 '{func_name}' 执行超时（{TOOL_EXEC_TIMEOUT}s），返回降级提示")
+                    result_text = f"Error: Tool '{func_name}' execution timed out. Please skip this step or ask user for confirmation."
+                    images = []
                 all_images.extend(images)
 
                 # ── 显式完成信号（需开启动态循环） ──
@@ -307,8 +383,12 @@ class AgentService:
             last_assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
             final_text = last_assistant.get("content", "") if last_assistant else "任务完成。"
 
-        # 触发即遗忘：后台异步记忆压缩
-        asyncio.create_task(
-            self.memory_service.process_session_memory(session_id)
-        )
+        # 触发即遗忘：后台异步记忆压缩（受熔断器保护）
+        from .. import circuit_breaker
+        if circuit_breaker is None or circuit_breaker.allow_new_task():
+            asyncio.create_task(
+                self.memory_service.process_session_memory(session_id)
+            )
+        else:
+            logger.debug("[Agent] 记忆压缩熔断中，跳过入队")
         return {"text": final_text, "images": all_images}

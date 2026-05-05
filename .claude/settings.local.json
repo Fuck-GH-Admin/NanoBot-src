@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile src/plugins/chatbot/guardian.py)",
+      "Bash(python -m py_compile src/plugins/chatbot/__init__.py)",
+      "Bash(python -m py_compile src/plugins/chatbot/services/agent_service.py)",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(flake8 src/plugins/chatbot/guardian.py src/plugins/chatbot/__init__.py src/plugins/chatbot/services/agent_service.py --max-line-length=120 --ignore=E501,W503)",
+      "Bash(xxd)",
+      "Bash(python -m pytest tests/test_deep_defense.py -v)",
+      "Bash(python -m pytest chatbot/tests/test_deep_defense.py -v)",
+      "Bash(python -m pytest test_deep_defense.py -v)",
+      "Bash(python -m pytest chatbot/tests/test_contract_drift.py -v)",
+      "Bash(python -c ' *)",
+      "Bash(python test_hybrid_retrieval.py)",
+      "Bash(python -c \"import faiss; print\\('faiss OK, version:', faiss.__version__\\)\")"
+    ]
+  }
+}

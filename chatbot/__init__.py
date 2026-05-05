@@ -1,17 +1,16 @@
 # src/plugins/chatbot/__init__.py
-import os
-import sys
 import shutil
 import asyncio
 import threading
-import subprocess
 from pathlib import Path
 
 from nonebot import get_driver
 from nonebot.log import logger
 from nonebot.plugin import PluginMetadata
+from loguru import logger as loguru_logger
 
 from .config import Config, plugin_config, start_config_web_server
+from .guardian import MemoryCircuitBreaker, EventLoopMonitor
 
 # 导入所有事件响应器
 from .matchers import (
@@ -29,6 +28,22 @@ __plugin_meta__ = PluginMetadata(
 
 driver = get_driver()
 
+
+# ==============================
+# 统一日志接管：文件轮转 sink
+# ==============================
+@driver.on_startup
+async def _setup_log_rotation():
+    loguru_logger.add(
+        "logs/chatbot.log",
+        rotation="10 MB",
+        retention=20,
+        encoding="utf-8",
+        enqueue=True,
+    )
+    logger.info("[Lifecycle] 日志轮转已启用: logs/chatbot.log (10MB/10天)")
+
+
 # ==============================
 # 原有：启动时清空临时下载目录
 # ==============================
@@ -45,84 +60,39 @@ async def clear_temp_directory():
 
 
 # ==============================
-# 新增：管理 Node.js 微服务
+# 熔断器全局对象
 # ==============================
-NODE_SERVER_DIR = Path(__file__).parent / "engine"
-NODE_SERVER_SCRIPT = NODE_SERVER_DIR / "server.js"
+circuit_breaker: MemoryCircuitBreaker = None
 
-node_process = None
 
-async def start_node_service():
-    """安装依赖并启动 Node.js 服务"""
-    global node_process
+async def _restart_memory_worker(mem_srv):
+    """熔断器回调：重启记忆压缩 Worker"""
+    await mem_srv.shutdown()
+    await asyncio.sleep(0.5)
+    await mem_srv.start_consumer()
 
-    # 启动前校验必要配置
-    if not plugin_config.node_deepseek_api_key:
-        raise ValueError("node_deepseek_api_key 未配置，无法启动 Node.js 微服务")
 
-    node_modules = NODE_SERVER_DIR / "node_modules"
-
-    # 首次运行时自动安装 npm 依赖
-    if not node_modules.exists():
-        logger.info("正在安装 Node.js 依赖...")
-        proc = await asyncio.create_subprocess_shell(
-            "npm install",
-            cwd=NODE_SERVER_DIR,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        await proc.wait()
-        if proc.returncode != 0:
-            logger.error("Node 依赖安装失败，请手动运行 npm install")
-            return
-        logger.info("Node 依赖安装完成")
-
-    logger.info("正在启动 Node.js 微服务...")
-    env = os.environ.copy()
-    env["DEEPSEEK_API_KEY"] = plugin_config.node_deepseek_api_key
-    env["DEEPSEEK_BASE_URL"] = plugin_config.node_base_url
-    env["DEEPSEEK_MODEL"] = plugin_config.node_model
-    env["LLM_TEMPERATURE"] = str(plugin_config.node_temperature)
-
-    node_process = subprocess.Popen(
-        ["node", str(NODE_SERVER_SCRIPT)],
-        cwd=NODE_SERVER_DIR,
-        env=env,
-        stdout=sys.stdout,
-        stderr=sys.stderr
-    )
-
-    # 等待 1 秒检查进程是否存活
-    await asyncio.sleep(1)
-    if node_process.poll() is None:
-        logger.info("Node.js 微服务启动成功")
-    else:
-        logger.error("Node.js 微服务启动失败，请检查 engine/server.js")
-
-async def stop_node_service():
-    """优雅终止 Node.js 进程"""
-    global node_process
-    if node_process and node_process.poll() is None:
-        logger.info("正在关闭 Node.js 微服务...")
-        node_process.terminate()
-        try:
-            node_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            node_process.kill()
-        logger.info("Node.js 微服务已停止")
-
-# ---------- Web 配置管理面板 ----------
 @driver.on_startup
 async def _boot_services():
-    # 启动 Node.js 微服务
-    asyncio.create_task(start_node_service())
+    global circuit_breaker
 
-    # 启动记忆压缩消费者协程（仅高可用队列模式需要）
+    # 1. 初始化熔断器，注册 Worker 重启回调
     from .services import agent_srv
+    circuit_breaker = MemoryCircuitBreaker(agent_srv.memory_service, plugin_config)
+    circuit_breaker.on_worker_dead = _restart_memory_worker
+
+    # 2. 启动熔断器监控循环
+    asyncio.create_task(circuit_breaker.monitor_loop())
+
+    # 3. 启动事件循环阻塞监控
+    event_loop_monitor = EventLoopMonitor(drift_threshold=1.5)
+    asyncio.create_task(event_loop_monitor.start_monitor())
+
+    # 4. 启动记忆压缩消费者协程（仅高可用队列模式需要）
     if plugin_config.enable_task_queue:
         asyncio.create_task(agent_srv.memory_service.start_consumer())
 
-    # 启动 Web 配置面板（后台线程，daemon 随主进程退出）
+    # 5. 启动 Web 配置面板（后台线程，daemon 随主进程退出）
     threading.Thread(
         target=start_config_web_server,
         args=(plugin_config, 8081),
@@ -134,10 +104,8 @@ async def _boot_services():
 async def _shutdown_services():
     from .services import agent_srv
 
-    # 优雅关闭记忆压缩队列（drain → 等待 worker → 关闭 httpx）
+    # 1. 优雅关闭记忆压缩队列（drain → 等待 worker → 关闭 httpx）
     await agent_srv.memory_service.shutdown()
 
-    # 清理 Agent HTTP 连接池
+    # 2. 清理 Agent HTTP 连接池
     await agent_srv.close()
-
-    await stop_node_service()

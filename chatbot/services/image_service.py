@@ -1,4 +1,5 @@
 import os
+import asyncio
 import random
 import time
 import re
@@ -82,46 +83,51 @@ class ImageService:
         生成抗风控副本
         移植自原 image_handler.py，包含多种噪声与元数据注入策略
         """
-        try:
-            # 简单缓存检查
-            hash_name = hashlib.md5(f"{original_path}_{strategy}".encode()).hexdigest()
-            out_path = self.stealth_dir / f"stealth_{hash_name}.png"
-            if out_path.exists():
-                return str(out_path)
+        # 简单缓存检查（纯路径判断，不涉及 IO 阻塞）
+        hash_name = hashlib.md5(f"{original_path}_{strategy}".encode()).hexdigest()
+        out_path = self.stealth_dir / f"stealth_{hash_name}.png"
+        if out_path.exists():
+            return str(out_path)
 
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._process_stealth_sync, original_path, out_path, strategy
+        )
+
+    def _process_stealth_sync(self, original_path: str, out_path: Path, strategy: int) -> str:
+        """同步的 Pillow 图像处理逻辑，在线程池中执行以避免阻塞事件循环。"""
+        try:
             img = Image.open(original_path).convert("RGBA")
             w, h = img.size
 
-            # === 策略实现 ===
             save_kwargs = {}
-            
-            if strategy == 0: # 微调像素 + 元数据
+
+            if strategy == 0:  # 微调像素 + 元数据
                 pixels = img.load()
                 if w > 10 and h > 10:
                     r, g, b, a = pixels[w-5, h-5]
                     pixels[w-5, h-5] = ((r + 1) % 256, g, b, a)
-                
+
                 info = PngImagePlugin.PngInfo()
                 info.add_text("GenTime", str(time.time()))
-                info.add_text("Nonce", str(random.randint(1000,9999)))
+                info.add_text("Nonce", str(random.randint(1000, 9999)))
                 save_kwargs["pnginfo"] = info
 
-            elif strategy == 1: # 稀疏噪点
+            elif strategy == 1:  # 稀疏噪点
                 pixels = img.load()
                 for x in range(0, w, 30):
                     for y in range(0, h, 30):
                         r, g, b, a = pixels[x, y]
-                        pixels[x, y] = (r, g, b, max(0, a - 1)) # 修改透明度微小值
+                        pixels[x, y] = (r, g, b, max(0, a - 1))
 
-            elif strategy == 2: # 微旋转
+            elif strategy == 2:  # 微旋转
                 img = img.rotate(0.1, resample=Image.BICUBIC, expand=False)
-            
-            elif strategy == 3: # 格式转换重编码 (JPEG -> PNG)
+
+            elif strategy == 3:  # 格式转换重编码 (JPEG -> PNG)
                 buf = BytesIO()
                 img.save(buf, format="JPEG", quality=95)
                 img = Image.open(buf).convert("RGBA")
 
-            # 保存
             img.save(out_path, "PNG", **save_kwargs)
             logger.info(f"[ImageService] Generated stealth image: {out_path.name}")
             return str(out_path)

@@ -56,9 +56,25 @@ async def handle_chat(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
     group_id = event.group_id if is_group else 0
     sender_name = await _get_nickname(bot, event)
 
+    # ---------- 新群拦截：未注册群需 @ 机器人且由管理员激活 ----------
+    if is_group:
+        gid_str = str(group_id)
+        if gid_str not in plugin_config.group_configs:
+            is_mentioned = False
+            try:
+                is_mentioned = event.is_tome()
+            except:
+                pass
+            is_authorized = perm_srv.is_superuser(user_id) or perm_srv.is_ai_admin(user_id)
+            if not (is_mentioned and is_authorized):
+                await chat_entry.finish()
+            plugin_config.group_configs[gid_str] = GroupSettings()
+            plugin_config.save_config()
+            logger.info(f"[ChatEntry] 新群 {group_id} 已激活并加入配置")
+
     # ---------- 阶段 A：静默记录 (仅群聊) ----------
     if is_group:
-        group_cfg = plugin_config.group_configs.get(str(group_id), GroupSettings())
+        group_cfg = plugin_config.group_configs[str(group_id)]
         if group_cfg.record_all_messages:
             session_id = f"group_{group_id}"
             try:
@@ -114,7 +130,7 @@ async def handle_chat(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
         "group_id": group_id,
         "is_admin": is_admin,
         "sender_name": sender_name,
-        "allow_r18": True,
+        "allow_r18": group_cfg.allow_r18 if is_group else False,
         "permission_service": perm_srv,
         "drawing_service": draw_srv,
         "image_service": img_srv,

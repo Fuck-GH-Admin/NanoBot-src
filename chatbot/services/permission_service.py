@@ -20,22 +20,13 @@ class PermissionService:
     3. 智能审计：基于 Node.js 大脑的违规内容判定。
     """
 
-    def __init__(self):
-        # 加载配置中的静态名单
-        self.superusers: Set[str] = plugin_config.superusers
-        self.ai_admin_qq: Set[str] = plugin_config.ai_admin_qq
-        self.private_whitelist: Set[str] = plugin_config.private_whitelist
-        self.drawing_whitelist: Set[str] = plugin_config.drawing_whitelist
-        # Node.js 对话接口地址（用于 AI 审计）
-        self.node_chat_url = plugin_config.node_chat_url
-
     # ================= 基础鉴权逻辑 =================
 
     def is_superuser(self, user_id: str) -> bool:
-        return user_id in self.superusers
+        return user_id in plugin_config.superusers
 
     def is_ai_admin(self, user_id: str) -> bool:
-        return user_id in self.ai_admin_qq
+        return user_id in plugin_config.ai_admin_qq
 
     def is_group_admin(self, sender_role: str) -> bool:
         return sender_role in ["owner", "admin"]
@@ -49,9 +40,9 @@ class PermissionService:
 
     def is_user_whitelisted(self, user_id: str, scope: Literal["private", "drawing"]) -> bool:
         if scope == "private":
-            return user_id in self.private_whitelist
+            return user_id in plugin_config.private_whitelist
         elif scope == "drawing":
-            return user_id in self.drawing_whitelist
+            return user_id in plugin_config.drawing_whitelist
         return False
 
     def is_private_whitelisted(self, user_id: str) -> bool:
@@ -177,7 +168,7 @@ class PermissionService:
         )
 
         try:
-            response_text = await self._call_node_chat(prompt)
+            response_text = await self._call_llm(prompt)
 
             match = re.search(r"\{.*\}", response_text, re.DOTALL)
             if match:
@@ -197,20 +188,26 @@ class PermissionService:
             logger.error(f"[Audit] AI processing failed: {e}")
             return f"❌ AI 审计过程出错: {e}"
 
-    async def _call_node_chat(self, user_prompt: str) -> str:
-        """
-        调用 Node.js 大脑进行简单对话（不涉及工具）
-        """
+    async def _call_llm(self, user_prompt: str) -> str:
+        """调用 LLM 进行简单对话（不涉及工具）"""
         messages = [{"role": "user", "content": user_prompt}]
         payload = {
-            "chatHistory": messages,
-            "tools": [],
-            "user_id": "audit_system"
+            "model": plugin_config.deepseek_model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 1024,
         }
 
         try:
             async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(self.node_chat_url, json=payload)
+                resp = await client.post(
+                    plugin_config.deepseek_api_url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {plugin_config.deepseek_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
                 if resp.status_code != 200:
                     logger.error(f"Audit API error {resp.status_code}: {resp.text}")
                     return ""
@@ -219,7 +216,7 @@ class PermissionService:
                 if choices:
                     return choices[0].get("message", {}).get("content", "")
         except Exception as e:
-            logger.error(f"Audit node call failed: {e}")
+            logger.error(f"Audit LLM call failed: {e}")
         return ""
 
     def parse_duration(self, text: str) -> int:

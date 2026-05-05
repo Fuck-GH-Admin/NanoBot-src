@@ -67,6 +67,19 @@ for p in paths:
 - 成功：处理后的图片路径
 - 失败：返回原始路径（降级）
 
+**实现机制 — 线程池卸载：**
+
+Pillow 的图像处理操作（`Image.open`、像素遍历、`rotate`、`save` 等）为纯同步的 CPU/IO 密集型操作。若直接在 `async def` 中执行，会阻塞 NoneBot 主事件循环，导致其他并发请求卡死。
+
+为此，`generate_stealth` 将核心处理逻辑抽离至同步方法 `_process_stealth_sync`，并通过 `asyncio.get_running_loop().run_in_executor(None, ...)` 将其提交到默认线程池执行，从而释放事件循环。
+
+```
+generate_stealth (async)
+  ├─ 缓存命中 → 直接返回
+  └─ 未命中 → loop.run_in_executor(_process_stealth_sync)
+                └─ Pillow 处理 + 保存（在线程池中运行）
+```
+
 **调用示例：**
 ```python
 stealth_path = await service.generate_stealth("/data/images/foo.png", strategy=1)

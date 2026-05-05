@@ -1,159 +1,210 @@
+import json
 import os
-import pandas as pd
-from typing import List, Dict, Optional, Tuple
+import aiosqlite
+from typing import List, Dict, Optional
 from pathlib import Path
 from nonebot.log import logger
 
 from ..config import plugin_config
 
+
 class ImageRepository:
     """
     图片元数据仓库
-    基于 Pandas 提供高效的 Excel 数据查询和文件路径管理。
+    基于 SQLite (aiosqlite) 查询 pixiv_master_image + pixiv_ai_info，
+    结合本地 JSON sidecar 文件解析标签与画师信息。
     """
+
     def __init__(self):
-        self.excel_path = plugin_config.excel_path
-        self.image_folder = plugin_config.image_folder
-        self.df: Optional[pd.DataFrame] = None
-        self._load_data()
+        self.db_path: str = plugin_config.db_path
+        self.image_folder: str = plugin_config.image_folder
 
-    def _load_data(self):
-        """同步加载 Excel 数据（通常在启动时执行）"""
-        if not os.path.exists(self.excel_path):
-            logger.warning(f"[ImageRepo] Excel file not found: {self.excel_path}")
-            return
+    def _get_json_path(self, save_name: str) -> Optional[Path]:
+        """从 save_name (如 xxx_p0.jpg) 推导 JSON sidecar 路径 (xxx_p.json)"""
+        p = Path(save_name)
+        # 11403_p0.jpg -> 11403_p.json
+        stem = p.stem  # 11403_p0
+        # 去掉最后的 _pN 后缀，换成 _p.json
+        if '_p' in stem:
+            base = stem.rsplit('_p', 1)[0]
+            json_name = f"{base}_p.json"
+            return p.parent / json_name
+        return None
 
-        try:
-            self.df = pd.read_excel(self.excel_path)
-            logger.info(f"[ImageRepo] Loaded {len(self.df)} image records.")
-        except Exception as e:
-            logger.error(f"[ImageRepo] Failed to load Excel: {e}")
-            self.df = None
+    def _read_sidecar(self, save_name: str) -> Dict:
+        """读取 JSON sidecar 文件，返回 {"tags": [...], "artist": str}"""
+        json_path = self._get_json_path(save_name)
+        if json_path and json_path.exists():
+            try:
+                with open(json_path, 'rb') as f:
+                    data = json.loads(f.read().decode('utf-8'))
+                return {
+                    "tags": data.get("Tags", []),
+                    "artist": data.get("Artist Name", ""),
+                }
+            except Exception:
+                pass
+        return {"tags": [], "artist": ""}
 
-    def refresh(self):
-        """手动刷新数据"""
-        self._load_data()
+    def _build_info_text(self, title: str, sidecar: Dict, is_ai: bool, image_id: int) -> str:
+        """构建图片描述信息"""
+        ai_str = "是" if is_ai else "否"
+        artist = sidecar.get("artist", "") or "N/A"
+        tag_str = ", ".join(str(t) for t in sidecar.get("tags", []))
+        return (
+            f"画师: {artist}\n"
+            f"图片ID: {image_id}\n"
+            f"标题: {title or 'N/A'}\n"
+            f"标签: {tag_str or 'N/A'}\n"
+            f"AI: {ai_str}"
+        )
 
-    def query_images(self, 
-                    keywords: List[str], 
-                    classification: Optional[str] = None, 
-                    no_ai: bool = False,
-                    limit: int = 50) -> List[Dict[str, str]]:
+    async def query_images(
+        self,
+        keywords: List[str],
+        classification: Optional[str] = None,
+        no_ai: bool = False,
+        limit: int = 50,
+    ) -> List[Dict[str, str]]:
         """
         查询图片
-        :param keywords: 关键词列表 (OR 逻辑，匹配任意一个即可，但会根据匹配度排序)
-        :param classification: 分类筛选 (R18, R18G, Artist)
+        :param keywords: 关键词列表 (OR 逻辑，匹配标题或标签)
+        :param classification: 分类筛选 (R18, R18G)
         :param no_ai: 是否过滤 AI 作品
         :param limit: 最大返回数量
-        :return: 图片信息列表 [{"path": str, "info": str, "id": str, ...}]
+        :return: 图片信息列表 [{"path": str, "info": str, "uid": str, "tags": str}]
         """
-        if self.df is None or self.df.empty:
-            logger.warning("[ImageRepo] Dataframe is empty or not loaded.")
+        if not os.path.exists(self.db_path):
+            logger.warning(f"[ImageRepo] DB not found: {self.db_path}")
             return []
 
-        df_view = self.df.copy()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # 构建 SQL 查询
+                # 基础 SELECT：LEFT JOIN pixiv_ai_info 以支持 AI 过滤
+                sql = """
+                    SELECT i.image_id, i.title, i.save_name, a.ai_type
+                    FROM pixiv_master_image i
+                    LEFT JOIN pixiv_ai_info a ON i.image_id = a.image_id
+                """
+                conditions = []
+                params = []
 
-        # 1. 分类过滤
-        if classification:
-            df_view = df_view[df_view['分类'] == classification]
-            if df_view.empty:
-                return []
+                # AI 过滤（数据库级别）
+                if no_ai:
+                    conditions.append("(a.ai_type IS NULL OR a.ai_type = 0)")
 
-        # 2. AI 过滤
-        if no_ai:
-            # 假设 Excel 中 '是否AI' 列为 1/0 或 True/False
-            df_view = df_view[~df_view['是否AI'].astype(bool)]
-            if df_view.empty:
-                return []
+                # 关键词过滤（匹配标题）
+                if keywords:
+                    kw_conds = []
+                    for kw in keywords:
+                        kw_conds.append("i.title LIKE ?")
+                        params.append(f"%{kw}%")
+                    conditions.append(f"({' OR '.join(kw_conds)})")
 
-        # 3. 关键词过滤
-        if keywords:
-            # 获取所有文本类型的列（排除目录列）
-            text_cols = [c for c in df_view.select_dtypes(include=['object']).columns if c != '相对目录']
-            
-            # 创建一个用于计分的 Series
-            df_view['match_score'] = 0
-            
-            for kw in keywords:
-                kw_str = str(kw).lower()
-                # 在所有文本列中查找
-                row_mask = pd.Series([False] * len(df_view), index=df_view.index)
-                for col in text_cols:
-                    # 包含关键词则为 True
-                    col_contains = df_view[col].astype(str).str.lower().str.contains(kw_str, regex=False, na=False)
-                    row_mask |= col_contains
-                
-                # 匹配到的行分数 +1
-                df_view.loc[row_mask, 'match_score'] += 1
-            
-            # 过滤掉分数为 0 的行
-            df_view = df_view[df_view['match_score'] > 0]
-            
-            # 按匹配分数降序排序
-            df_view = df_view.sort_values(by='match_score', ascending=False)
+                if conditions:
+                    sql += " WHERE " + " AND ".join(conditions)
 
-        # 4. 随机抽样或取前N个
-        # 如果没有关键词，随机打乱；如果有关键词，前面已经排好序了
-        if not keywords:
-            df_view = df_view.sample(frac=1) # Shuffle
+                # 无关键词时随机排序，有关键词时按 rowid（近似插入序）
+                if keywords:
+                    sql += " ORDER BY i.image_id DESC"
+                else:
+                    sql += " ORDER BY RANDOM()"
 
-        results = []
-        count = 0
-        
-        # 遍历结果并验证文件存在性
-        for _, row in df_view.iterrows():
-            if count >= limit:
-                break
-                
-            rel_path = str(row.get('相对目录', '')).replace('\\', os.sep)
-            full_path = os.path.join(self.image_folder, rel_path)
-            
-            if os.path.exists(full_path):
-                # 构建返回信息
-                is_ai = '是' if bool(row.get('是否AI')) else '否'
-                info_text = (
-                    f"画师: {row.get('画师名称', 'N/A')} (ID: {row.get('画师UID', 'N/A')})\n"
-                    f"图片ID: {row.get('图片文件UID', 'N/A')}\n"
-                    f"标题: {row.get('作品标题', 'N/A')}\n"
-                    f"标签: {row.get('图片标签', 'N/A')}\n"
-                    f"分类: {row.get('分类', 'N/A')} | AI: {is_ai}"
-                )
-                
-                results.append({
-                    "path": full_path,
-                    "info": info_text,
-                    "uid": str(row.get('图片文件UID', '')),
-                    "tags": str(row.get('图片标签', ''))
-                })
-                count += 1
-            else:
-                logger.debug(f"[ImageRepo] File missing: {full_path}")
+                # 多取一些，因为后续还要过滤不存在的文件和 R18
+                sql += " LIMIT ?"
+                params.append(limit * 5)
 
-        return results
+                cursor = await db.execute(sql, params)
+                rows = await cursor.fetchall()
 
-    def get_image_by_id(self, uid: str) -> Optional[Dict]:
-        """根据图片UID精确获取图片"""
-        if self.df is None: return None
-        
-        # 转换为字符串比较
-        row = self.df[self.df['图片文件UID'].astype(str) == str(uid)]
-        if row.empty:
+                results = []
+                for row in rows:
+                    if len(results) >= limit:
+                        break
+
+                    image_id, title, save_name, ai_type = row
+
+                    # 验证文件实际存在
+                    if not save_name or not os.path.exists(save_name):
+                        continue
+
+                    is_ai = ai_type is not None and ai_type != 0
+
+                    # 读取 JSON sidecar（获取标签和画师信息）
+                    sidecar = self._read_sidecar(save_name)
+
+                    # 分类过滤（R18/R18G 基于标签）
+                    if classification:
+                        tags_lower = [str(t).lower() for t in sidecar["tags"]]
+                        if classification.upper() == "R18":
+                            if not any("r-18" in t and "r-18g" not in t for t in tags_lower):
+                                continue
+                        elif classification.upper() == "R18G":
+                            if not any("r-18g" in t for t in tags_lower):
+                                continue
+
+                    # 关键词二次匹配（标题 + 标签，SQL 只匹配了标题）
+                    if keywords:
+                        kw_lower = [k.lower() for k in keywords]
+                        title_lower = (title or "").lower()
+                        tags_joined = " ".join(str(t) for t in sidecar["tags"]).lower()
+                        artist_name = sidecar.get("artist", "").lower()
+                        searchable = f"{title_lower} {tags_joined} {artist_name}"
+                        if not any(kw in searchable for kw in kw_lower):
+                            continue
+
+                    info_text = self._build_info_text(title, sidecar, is_ai, image_id)
+                    tag_str = ", ".join(str(t) for t in sidecar["tags"])
+
+                    results.append({
+                        "path": save_name,
+                        "info": info_text,
+                        "uid": str(image_id),
+                        "tags": tag_str,
+                    })
+
+                return results
+
+        except Exception as e:
+            logger.error(f"[ImageRepo] Query failed: {e}")
+            return []
+
+    async def get_image_by_id(self, uid: str) -> Optional[Dict]:
+        """根据图片 ID 精确获取图片"""
+        if not os.path.exists(self.db_path):
             return None
-            
-        row = row.iloc[0]
-        rel_path = str(row.get('相对目录', '')).replace('\\', os.sep)
-        full_path = os.path.join(self.image_folder, rel_path)
-        
-        if os.path.exists(full_path):
-            is_ai = '是' if bool(row.get('是否AI')) else '否'
-            info_text = (
-                f"画师: {row.get('画师名称', 'N/A')}\n"
-                f"ID: {row.get('图片文件UID', 'N/A')}\n"
-                f"AI: {is_ai}"
-            )
-            return {
-                "path": full_path,
-                "info": info_text,
-                "uid": str(row.get('图片文件UID', ''))
-            }
-        return None
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT i.image_id, i.title, i.save_name, a.ai_type
+                    FROM pixiv_master_image i
+                    LEFT JOIN pixiv_ai_info a ON i.image_id = a.image_id
+                    WHERE i.image_id = ?
+                    """,
+                    (int(uid),),
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+
+                image_id, title, save_name, ai_type = row
+
+                if not save_name or not os.path.exists(save_name):
+                    return None
+
+                is_ai = ai_type is not None and ai_type != 0
+                sidecar = self._read_sidecar(save_name)
+                info_text = self._build_info_text(title, sidecar, is_ai, image_id)
+
+                return {
+                    "path": save_name,
+                    "info": info_text,
+                    "uid": str(image_id),
+                }
+
+        except Exception as e:
+            logger.error(f"[ImageRepo] get_image_by_id failed: {e}")
+            return None

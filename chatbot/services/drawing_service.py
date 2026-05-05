@@ -1,5 +1,6 @@
 # src/plugins/chatbot/services/drawing_service.py
 
+import asyncio
 import httpx
 import asyncio
 from typing import Tuple
@@ -19,11 +20,6 @@ class DrawingService:
     def __init__(self):
         self.image_dir = Path("data/generated_images")
         self.image_dir.mkdir(parents=True, exist_ok=True)
-
-        self.api_key = plugin_config.siliconflow_api_key
-        self.api_url = plugin_config.siliconflow_api_url
-        # Node.js 对话接口地址（用于 prompt 优化）
-        self.node_chat_url = plugin_config.node_chat_url
 
     async def generate_image(self, simple_prompt: str, user_id: str) -> Tuple[str, str]:
         """
@@ -61,9 +57,7 @@ class DrawingService:
             return "", f"❌ 发生错误: {e}"
 
     async def _enhance_prompt(self, simple_prompt: str) -> str:
-        """
-        调用 Node.js 大脑优化绘图提示词
-        """
+        """调用 LLM 优化绘图提示词"""
         messages = [
             {
                 "role": "user",
@@ -75,15 +69,28 @@ class DrawingService:
             }
         ]
         payload = {
-            "chatHistory": messages,
-            "tools": [],          # 不需要工具调用
-            "user_id": "drawing_optimizer"
+            "model": plugin_config.deepseek_model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 1024,
         }
 
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(self.node_chat_url, json=payload)
+            resp = await client.post(
+                plugin_config.deepseek_api_url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {plugin_config.deepseek_api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
             if resp.status_code != 200:
                 logger.error(f"Enhance prompt API error {resp.status_code}: {resp.text}")
+                if resp.status_code in (402, 403):
+                    from ..utils.alert_manager import send_emergency_alert
+                    asyncio.create_task(send_emergency_alert(
+                        f"⚠️ API 拒绝访问 ({resp.status_code})，画图提示词增强不可用，请检查 API 余额或风控状态。"
+                    ))
                 return simple_prompt
 
             data = resp.json()
@@ -97,7 +104,7 @@ class DrawingService:
         异步调用 SiliconFlow API
         """
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {plugin_config.siliconflow_api_key}",
             "Content-Type": "application/json"
         }
 
@@ -111,7 +118,7 @@ class DrawingService:
         async with httpx.AsyncClient() as session:
             # 1. 请求生成
             async with session.post(
-                f"{self.api_url}/images/generations",
+                f"{plugin_config.siliconflow_api_url}/images/generations",
                 json=payload,
                 headers=headers
             ) as resp:

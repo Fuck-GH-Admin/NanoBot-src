@@ -10,6 +10,8 @@
 
 ### `PermissionService`
 
+> **热更新支持：** 本服务不在 `__init__` 中缓存配置数据。所有鉴权方法（`is_superuser`、`is_ai_admin`、`is_user_whitelisted` 等）在每次调用时实时读取 `plugin_config` 中的最新值，确保 YAML 配置热重载后立即生效。
+
 | 方法 | 说明 |
 |------|------|
 | `is_superuser` | 检查是否为最高权限宿主 |
@@ -105,3 +107,4 @@ seconds = perm_service.parse_duration("5分钟")  # 返回 300
 | 审计调用 | `self.llm_service.chat(...)` | `self._call_node_chat(...)` → Node.js 大脑 |
 | HTTP 库 | `aiohttp` | `httpx` |
 | 构造函数 | 初始化 `self.llm_service = LLMService()` | 初始化 `self.node_chat_url` |
+| 配置绑定 | `__init__` 中硬绑定 `self.superusers` 等 | 每次方法调用实时读取 `plugin_config`（支持热重载） |

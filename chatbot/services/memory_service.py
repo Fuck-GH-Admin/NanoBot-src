@@ -12,6 +12,7 @@ from nonebot.log import logger
 from ..config import plugin_config
 from ..repositories.memory_repo import MemoryRepository
 from ..repositories.models import CompactionJournal
+from ..utils.alert_manager import send_emergency_alert
 
 
 # ─────────────────── 常量 ───────────────────
@@ -324,6 +325,17 @@ class MemoryService:
 
             except Exception as e:
                 last_error = str(e)
+
+                # API 拒绝服务（402/403）：不消耗重试次数，直接退出，避免雪崩
+                if "402" in last_error or "403" in last_error:
+                    logger.error(
+                        f"[MemoryService] {session_id} API 拒绝访问，跳过重试，等待恢复"
+                    )
+                    await self.repo.update_compaction_journal(
+                        journal_id, status="pending", last_error=last_error
+                    )
+                    return
+
                 logger.warning(
                     f"[MemoryService] {session_id} 第 {attempt + 1}/{MAX_RETRIES} 次失败: {last_error}"
                 )
@@ -474,6 +486,10 @@ class MemoryService:
                 },
             )
             if resp.status_code != 200:
+                if resp.status_code in (402, 403):
+                    asyncio.create_task(send_emergency_alert(
+                        f"⚠️ API 拒绝访问 ({resp.status_code})，记忆压缩功能不可用，请尽快检查 API 余额或风控状态。"
+                    ))
                 raise RuntimeError(
                     f"DeepSeek API 错误 {resp.status_code}: {resp.text[:300]}"
                 )

@@ -223,22 +223,38 @@ LLM 返回 tool_calls
 
 ---
 
-## 5. 安全架构
+## 5. 性能与可靠性
 
-### 5.1 管理面板零信任
+### 5.1 事件循环保护
+
+Pillow 等 CPU/IO 密集型同步操作通过 `loop.run_in_executor()` 卸载到线程池，避免阻塞 NoneBot 主事件循环。当前应用于 `ImageService.generate_stealth`。
+
+### 5.2 文件原子写入
+
+`AsyncFileUtils.write_json` 采用临时文件 + `os.replace` 策略实现原子写入。写入中途进程崩溃不会损坏原始文件，`os.replace` 在 OS 层面保证替换的原子性。
+
+### 5.3 配置热重载
+
+所有服务（`PermissionService`、`DrawingService`、`AgentService` 等）不在 `__init__` 中硬绑定配置数据。鉴权名单、API 密钥、超时时间等均在每次方法执行时实时读取 `plugin_config`，配合 YAML 文件的 watchdog 热监听，实现配置变更即时生效。
+
+---
+
+## 6. 安全架构
+
+### 6.1 管理面板零信任
 
 - 每次 Python 重启生成新 Token（`secrets.token_urlsafe(32)`）
 - HTML 页面通过 `<meta>` 标签注入 Token，前端读取后立即 `.remove()`
 - 所有 `/api/config` 请求需携带 `Authorization: Bearer <token>`
 - 使用 `secrets.compare_digest` 进行常量时间比较（防时序攻击）
 
-### 5.2 提示词注入防护
+### 6.2 提示词注入防护
 
 - 所有动态变量（用户名、群聊内容、画像）经 `escapeXml()` 转义
 - XML 标签块自动包裹，防止结构破坏
 - 世界书条目内容原样注入（受信任来源），但经宏替换引擎处理
 
-### 5.3 工具权限模型
+### 6.3 工具权限模型
 
 ```
 权限等级：

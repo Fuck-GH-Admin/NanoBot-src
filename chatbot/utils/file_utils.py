@@ -1,5 +1,6 @@
 # src/plugins/chatbot/utils/file_utils.py
 
+import os
 import json
 import aiofiles
 from pathlib import Path
@@ -34,12 +35,18 @@ class AsyncFileUtils:
         path = Path(path)
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            
+
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
                 content = json.dumps(data, ensure_ascii=False, indent=2)
                 await f.write(content)
+            os.replace(str(tmp_path), str(path))
             return True
         except Exception as e:
             logger.error(f"[FileUtils] Write failed: {path} - {e}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return False

@@ -14,7 +14,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # 配置文件路径
-CONFIG_FILE = Path("config_bot_base.yaml")
+CONFIG_FILE = Path(__file__).resolve().parent.parent.parent.parent / "config" / "config_bot_base.yaml"
 WEB_PORT = 8081
 
 
@@ -40,17 +40,13 @@ class Config(BaseSettings):
     deepseek_api_url: str = "https://api.deepseek.com/chat/completions"
     deepseek_model_name: str = "deepseek-v4-flash"
 
-    # SiliconFlow (画图)
+    # SiliconFlow (画图 + Embedding + Reranker)
     siliconflow_api_key: str = ""
     siliconflow_api_url: str = "https://api.siliconflow.cn/v1"
     siliconflow_model_name: str = "Kwai-Kolors/Kolors"
-
-    # Node.js 引擎
-    node_chat_url: str = "http://127.0.0.1:3010/api/chat"
-    node_deepseek_api_key: str = ""
-    node_base_url: str = "https://api.deepseek.com"
-    node_model: str = "deepseek-chat"
-    node_temperature: float = 0.7
+    embedding_model_name: str = "BAAI/bge-m3"
+    reranker_model_name: str = "BAAI/bge-reranker-v2-m3"
+    enable_reranker: bool = False
 
     # Agent 循环
     agent_max_loops: int = 10
@@ -64,12 +60,15 @@ class Config(BaseSettings):
     semantic_lorebook_enabled: bool = False  # 阶段三：语义向量检索
     token_arbitration_enabled: bool = False  # 阶段三：Token 预算仲裁
 
+    # 画图
+    drawing_enhance_timeout: float = Field(default=30.0, description="画图提示词优化的超时时间")
+
     # 路径
     image_folder: str = r"D:\小项目\pixiv下载图片\pixiv下载图片\最终版\pixiv_downloads"
     books_folder: str = r"D:\文件\学习资料\本"
-    excel_path: str = r"D:\小项目\pixiv下载图片\pixiv下载图片\最终版\pixiv_downloads\pixiv_artworks_fix.xlsx"
+    db_path: str = r"C:\Users\Bot\Bot\pixiv\PixivUtil2\db.sqlite"
     jm_download_dir: str = r"data/jm_temp"
-    jm_option_path: str = r"data/option.yml"
+    jm_option_path: str = r"config/option.yml"
     font_path: str = r"C:\Windows\Fonts\msyh.ttc"
 
     # 权限集合
@@ -184,10 +183,6 @@ class ConfigManager:
             "deepseek_api_key": "",
             "deepseek_api_url": "https://api.deepseek.com/chat/completions",
             "deepseek_model_name": "deepseek-v4-flash",
-            "node_chat_url": "http://127.0.0.1:3010/api/chat",
-            "node_deepseek_api_key": "",
-            "node_model": "deepseek-chat",
-            "node_temperature": 0.7,
             "agent_max_loops": 10,
             "agent_request_timeout": 60.0,
             "enable_strict_schema": True,
@@ -199,11 +194,15 @@ class ConfigManager:
             "siliconflow_api_key": "",
             "siliconflow_api_url": "https://api.siliconflow.cn/v1",
             "siliconflow_model_name": "Kwai-Kolors/Kolors",
+            "embedding_model_name": "BAAI/bge-m3",
+            "reranker_model_name": "BAAI/bge-reranker-v2-m3",
+            "enable_reranker": False,
+            "drawing_enhance_timeout": 30.0,
             "image_folder": r"D:\小项目\pixiv下载图片\pixiv下载图片\最终版\pixiv_downloads",
             "books_folder": r"D:\文件\学习资料\本",
-            "excel_path": r"D:\小项目\pixiv下载图片\pixiv下载图片\最终版\pixiv_downloads\pixiv_artworks_fix.xlsx",
+            "db_path": r"C:\Users\Bot\Bot\pixiv\PixivUtil2\db.sqlite",
             "jm_download_dir": "data/jm_temp",
-            "jm_option_path": "data/option.yml",
+            "jm_option_path": "config/option.yml",
             "font_path": r"C:\Windows\Fonts\msyh.ttc",
             "superusers": [],
             "private_whitelist": [],
@@ -212,6 +211,7 @@ class ConfigManager:
             "welcome_groups": [],
             "welcome_mode": "all"
         }
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             yaml.dump(default, f, allow_unicode=True, default_flow_style=False)
         self.load_config()
