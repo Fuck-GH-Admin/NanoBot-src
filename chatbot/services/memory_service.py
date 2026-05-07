@@ -460,7 +460,7 @@ class MemoryService:
         # 5. 调用 DeepSeek（带 Function Calling）
         api_key = plugin_config.deepseek_api_key
         api_url = plugin_config.deepseek_api_url
-        model = plugin_config.deepseek_model_name
+        model = plugin_config.deepseek_memory_model_name
 
         if not api_key:
             logger.warning("[MemoryService] 未配置 deepseek_api_key，跳过记忆压缩")
@@ -473,7 +473,8 @@ class MemoryService:
             "tool_choice": {"type": "function", "function": {"name": "update_memory_graph"}},
             "stream": False,
             "temperature": 0.3,
-            "max_tokens": 4000,
+            "max_tokens": 8000,
+            "thinking": {"type": "disabled"},
         }
 
         try:

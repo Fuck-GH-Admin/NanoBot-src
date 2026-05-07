@@ -6,13 +6,15 @@ from .base_tool import BaseTool
 
 class RecommendBookTool(BaseTool):
     name = "recommend_book"
-    description = "随机从书架上推荐一本书，并直接发送给用户。"
+    description = '【条件触发】：当用户要求"发点书"、"推荐本子"、"搞点学习资料"时，**绝对禁止假装发送**，必须输出 tool_call 调用此工具，系统会自动发送真实文件。'
     parameters = {
         "type": "object",
         "properties": {},
         "required": []
     }
     require_permission = "user"
+    risk_level = "low"
+    allow_forced_exec = True
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
         # R18 权限阻断
@@ -59,7 +61,7 @@ class RecommendBookTool(BaseTool):
 
 class JmDownloadTool(BaseTool):
     name = "jm_download"
-    description = "通过本子ID下载禁漫资源，支持多个ID。"
+    description = '【条件触发】：当用户提供了一串数字ID，并要求"下载"、"看这个本子"时，必须输出 tool_call 调用此工具进行真实下载。'
     parameters = {
         "type": "object",
         "properties": {
@@ -72,6 +74,8 @@ class JmDownloadTool(BaseTool):
         "required": ["ids"]
     }
     require_permission = "user"
+    risk_level = "low"
+    allow_forced_exec = True
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
         # R18 权限阻断

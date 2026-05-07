@@ -6,7 +6,7 @@ from .base_tool import BaseTool
 
 class BanUserTool(BaseTool):
     name = "ban_user"
-    description = "禁言指定的群成员。需要管理员权限。"
+    description = '【条件触发】：当管理员命令你"禁言XXX"、"让他闭嘴"时，必须输出 tool_call 调用此工具来执行真实的群管操作，绝对禁止仅用文字恐吓。'
     parameters = {
         "type": "object",
         "properties": {
@@ -26,6 +26,8 @@ class BanUserTool(BaseTool):
         "required": ["target_id", "duration"]
     }
     require_permission = "admin"
+    risk_level = "high"
+    allow_forced_exec = False
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
         target_id = arguments.get("target_id")

@@ -18,6 +18,8 @@ class MarkTaskCompleteTool(BaseTool):
         "required": ["summary"]
     }
     require_permission = "system"
+    risk_level = "low"
+    allow_forced_exec = False
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
         return f"任务完成: {arguments.get('summary', '')}", []

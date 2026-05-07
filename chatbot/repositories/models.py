@@ -1,13 +1,15 @@
 """
 SQLAlchemy 2.0 异步声明式模型
 
-六张核心表：
+八张核心表：
 - ChatHistory:       对话流水账（每条消息一行）
 - GroupMemory:       群组宏观摘要（每 session 一行）
 - UserTrait:         群友精细画像图谱（每条特征一行）
 - CompactionJournal: 记忆压缩任务流水账（含重试状态 & 死信）
 - Entity:            知识图谱实体节点
 - Relation:          知识图谱实体间关系（三元组）
+- CustomRule:        动态暗号规则
+- RuleChangelog:     规则审计日志
 """
 
 from datetime import datetime, timezone
@@ -141,3 +143,54 @@ class Relation(Base):
 
     def __repr__(self) -> str:
         return f"<Relation id={self.relation_id} {self.subject_entity}--{self.predicate}--{self.object_entity}>"
+
+
+class CustomRule(Base):
+    """动态暗号规则"""
+    __tablename__ = "custom_rule"
+
+    rule_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    scope_type: Mapped[str] = mapped_column(Text, nullable=False)  # 'group'/'private'/'global'
+    scope_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    keywords_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords: Mapped[list] = mapped_column(JSON, nullable=False)
+    tool_name: Mapped[str] = mapped_column(Text, nullable=False)
+    args_extractor: Mapped[str] = mapped_column(Text, nullable=False)  # 'number_list'/'string_after_kw'/'none'/'pattern'
+    pattern_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    examples: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_hit: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+    ttl_days: Mapped[int] = mapped_column(Integer, default=30)
+    active: Mapped[int] = mapped_column(Integer, default=1)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    allow_forced_exec: Mapped[int] = mapped_column(Integer, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("scope_type", "scope_id", "keywords_hash", name="uq_rule_scope_hash"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CustomRule id={self.rule_id} scope={self.scope_type}:{self.scope_id} tool={self.tool_name}>"
+
+
+class RuleChangelog(Base):
+    """规则审计日志"""
+    __tablename__ = "rule_changelog"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    rule_id: Mapped[str] = mapped_column(Text, nullable=False)
+    operator: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scope_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    old_value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    new_value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<RuleChangelog id={self.id} action={self.action} rule={self.rule_id}>"

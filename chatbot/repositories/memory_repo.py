@@ -17,7 +17,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 
-from sqlalchemy import select, update, delete, text, insert
+from sqlalchemy import select, update, delete, text
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -281,7 +282,7 @@ class MemoryRepository:
                     .on_conflict_do_update(
                         index_elements=["session_id", "user_id", "content"],
                         set_={
-                            "confidence": max(UserTrait.confidence, confidence),
+                            "confidence": confidence,
                             "updated_at": now,
                             "source_msg_id": source_msg_id or UserTrait.source_msg_id,
                         },

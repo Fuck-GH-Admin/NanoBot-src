@@ -39,6 +39,9 @@ class Config(BaseSettings):
     deepseek_api_key: str = ""
     deepseek_api_url: str = "https://api.deepseek.com/chat/completions"
     deepseek_model_name: str = "deepseek-v4-flash"
+    deepseek_memory_model_name: str = "deepseek-v4-flash"
+    logic_model_name: str = ""              # 逻辑脑模型，为空则使用 deepseek_model_name
+    enable_dual_brain: bool = True          # 双脑模式开关
 
     # SiliconFlow (画图 + Embedding + Reranker)
     siliconflow_api_key: str = ""
@@ -126,7 +129,7 @@ class ConfigManager:
 
                 # 类型转换
                 try:
-                    if target_type is Set[str]:
+                    if "Set" in str(target_type) or "set" in str(target_type):
                         if isinstance(value, list):
                             value = set(value)
                         elif isinstance(value, str):
@@ -183,6 +186,9 @@ class ConfigManager:
             "deepseek_api_key": "",
             "deepseek_api_url": "https://api.deepseek.com/chat/completions",
             "deepseek_model_name": "deepseek-v4-flash",
+            "deepseek_memory_model_name": "deepseek-v4-flash",
+            "logic_model_name": "",
+            "enable_dual_brain": True,
             "agent_max_loops": 10,
             "agent_request_timeout": 60.0,
             "enable_strict_schema": True,
@@ -235,16 +241,19 @@ class ConfigManager:
         self._observer = observer
 
     # 代理内部 Config 的属性访问
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return getattr(self._config, name)
-
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in ("_config", "_lock", "_observer"):
+        # 所有私有属性（_开头）以及核心容器直接存到实例自身
+        if name.startswith('_') or name in ("_config", "_lock", "_observer"):
             super().__setattr__(name, value)
         else:
             setattr(self._config, name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        # 私有属性不会走到这里，因为实例自身已经有了
+        # 这里只是作为兜底，继续对公开属性代理
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._config, name)
 
 
 # ---------- Web 配置管理面板 ----------
@@ -345,11 +354,13 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
             field_info = Config.model_fields[key]
             target_type = field_info.annotation
             try:
-                if target_type is Set[str]:
+                if "Set" in str(target_type) or "set" in str(target_type):
                     if isinstance(value, list):
                         processed[key] = value
                     elif isinstance(value, str):
-                        processed[key] = [s.strip() for s in value.split(",") if s.strip()]
+                        # 核心修复：自动剔除不小心填入的括号和引号
+                        clean_val = value.replace("[", "").replace("]", "").replace('"', "").replace("'", "")
+                        processed[key] = [s.strip() for s in clean_val.split(",") if s.strip()]
                     else:
                         raise ValueError("应为列表或逗号分隔字符串")
                 elif target_type is bool:

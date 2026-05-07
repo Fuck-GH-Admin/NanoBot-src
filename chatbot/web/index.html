@@ -288,6 +288,14 @@
                     <input type="text" id="deepseek_model_name">
                 </div>
                 <div class="form-group">
+                    <label>记忆压缩模型</label>
+                    <input type="text" id="deepseek_memory_model_name" placeholder="deepseek-v4-flash">
+                </div>
+                <div class="form-group">
+                    <label>逻辑调度模型</label>
+                    <input type="text" id="logic_model_name" placeholder="留空则使用主模型">
+                </div>
+                <div class="form-group">
                     <label>SiliconFlow API Key</label>
                     <input type="password" id="siliconflow_api_key" placeholder="sk-...">
                 </div>
@@ -327,6 +335,13 @@
                 <div class="form-group">
                     <label>请求超时 (秒)</label>
                     <input type="number" id="agent_request_timeout" step="0.5" min="5">
+                </div>
+                <div class="form-group">
+                    <label>双脑分工模式</label>
+                    <label class="toggle-label">
+                        <input type="checkbox" class="toggle-checkbox" id="enable_dual_brain" checked>
+                        <div class="toggle"></div>
+                    </label>
                 </div>
             </div>
         </div>
@@ -433,6 +448,7 @@
         // 字符串/数字字段
         const textFields = [
             'deepseek_api_key', 'deepseek_api_url', 'deepseek_model_name',
+            'deepseek_memory_model_name', 'logic_model_name',
             'siliconflow_api_key', 'siliconflow_api_url', 'siliconflow_model_name',
             'embedding_model_name', 'reranker_model_name',
             'image_folder', 'books_folder', 'db_path',
@@ -441,7 +457,10 @@
         ];
         textFields.forEach(id => {
             const el = document.getElementById(id);
-            if (el) el.value = cfg[id] !== undefined ? cfg[id] : '';
+            if (el) {
+                const val = cfg[id];
+                el.value = Array.isArray(val) ? val.join(", ") : (val !== undefined ? val : '');
+            }
         });
 
         // 数字字段
@@ -450,6 +469,7 @@
 
         // 开关字段
         $('#enable_reranker').checked = !!cfg.enable_reranker;
+        $('#enable_dual_brain').checked = !!cfg.enable_dual_brain;
 
         // Set 字段（以逗号分隔显示）
         const setFields = ['superusers', 'private_whitelist', 'ai_admin_qq', 'drawing_whitelist', 'welcome_groups'];
@@ -473,6 +493,7 @@
         // 文本字段
         const textFields = [
             'deepseek_api_key', 'deepseek_api_url', 'deepseek_model_name',
+            'deepseek_memory_model_name', 'logic_model_name',
             'siliconflow_api_key', 'siliconflow_api_url', 'siliconflow_model_name',
             'embedding_model_name', 'reranker_model_name',
             'image_folder', 'books_folder', 'db_path',
@@ -486,6 +507,7 @@
 
         // 开关字段
         data.enable_reranker = $('#enable_reranker').checked;
+        data.enable_dual_brain = $('#enable_dual_brain').checked;
 
         // 数字（isNaN 守卫避免 0 被 || 吞掉）
         const loops = parseInt($('#agent_max_loops').value);

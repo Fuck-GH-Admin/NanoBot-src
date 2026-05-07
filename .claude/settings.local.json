@@ -14,7 +14,11 @@
       "Bash(python -m pytest chatbot/tests/test_contract_drift.py -v)",
       "Bash(python -c ' *)",
       "Bash(python test_hybrid_retrieval.py)",
-      "Bash(python -c \"import faiss; print\\('faiss OK, version:', faiss.__version__\\)\")"
+      "Bash(python -c \"import faiss; print\\('faiss OK, version:', faiss.__version__\\)\")",
+      "Bash(python -m pytest tests/test_rule_repo.py -v)",
+      "Bash(pip list *)",
+      "Bash(python -c \"import sys; from unittest.mock import MagicMock; [sys.modules.__setitem__\\(m, MagicMock\\(\\)\\) for m in ['nonebot','nonebot.log','nonebot.adapters','nonebot.adapters.onebot','nonebot.adapters.onebot.v11','img2pdf','PyPDF2','PIL','PIL.Image','aiofiles','httpx','faiss']]; from repositories.memory_repo import MemoryRepository; print\\('OK'\\)\")",
+      "Bash(python -c \"import nonebot; print\\(dir\\(nonebot\\)\\)\")"
     ]
   }
 }

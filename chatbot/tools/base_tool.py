@@ -15,6 +15,8 @@ class BaseTool(ABC):
     description: str = ""
     parameters: Dict[str, Any] = {}
     require_permission: str = "user"  # user, drawing_whitelist, admin 等
+    risk_level: str = "low"           # low / high
+    allow_forced_exec: bool = True    # 是否允许规则兜底执行
 
     @abstractmethod
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:

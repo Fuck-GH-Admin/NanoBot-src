@@ -26,6 +26,7 @@ class MessageRole(str, Enum):
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
+    TOOL = "tool"  # 新增此行以支持工具调用回调消息
 
 
 class InjectionPosition(IntEnum):
@@ -569,6 +570,7 @@ class PromptPipeline:
         wi_after: str = "",
         depth_items: list | None = None,
         extra_blocks: list | None = None,
+        include_role_play_setting: bool = True,
     ) -> list[ChatMessage]:
         """
         Build a complete, budget-enforced message list.
@@ -609,6 +611,7 @@ class PromptPipeline:
             persona_description=persona_description,
             wi_before=wi_before,
             wi_after=wi_after,
+            include_role_play_setting=include_role_play_setting,
         )
 
         if extra_blocks:
@@ -635,6 +638,7 @@ class PromptPipeline:
         persona_description: str = "",
         wi_before: str = "",
         wi_after: str = "",
+        include_role_play_setting: bool = True,
     ) -> list:
         """Assemble the 6 priority SystemBlocks from character data."""
         from .token_budget import Priority, SystemBlock
@@ -651,21 +655,22 @@ class PromptPipeline:
         ))
 
         # Priority 2: Role-play setting (never_cut)
-        setting_parts: list[str] = []
-        if char.description:
-            setting_parts.append(char.description)
-        if char.personality:
-            setting_parts.append(f"{char.name}'s personality: {char.personality}")
-        if char.scenario:
-            setting_parts.append(f"Scenario: {char.scenario}")
-        if persona_description:
-            setting_parts.append(persona_description)
-        blocks.append(SystemBlock(
-            name="role_play_setting",
-            content="\n".join(setting_parts),
-            priority=Priority.ROLE_PLAY_SETTING,
-            never_cut=True,
-        ))
+        if include_role_play_setting:
+            setting_parts: list[str] = []
+            if char.description:
+                setting_parts.append(char.description)
+            if char.personality:
+                setting_parts.append(f"{char.name}'s personality: {char.personality}")
+            if char.scenario:
+                setting_parts.append(f"Scenario: {char.scenario}")
+            if persona_description:
+                setting_parts.append(persona_description)
+            blocks.append(SystemBlock(
+                name="role_play_setting",
+                content="\n".join(setting_parts),
+                priority=Priority.ROLE_PLAY_SETTING,
+                never_cut=True,
+            ))
 
         # Priority 3: Chat history — handled separately via history list
 

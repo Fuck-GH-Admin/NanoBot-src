@@ -6,7 +6,7 @@ from .base_tool import BaseTool
 
 class GenerateImageTool(BaseTool):
     name = "generate_image"
-    description = "根据文字描述生成一张图片。需要绘图白名单权限。"
+    description = '【条件触发】：当用户明确要求"画一张图"、"生成一张XX"时，**绝对禁止用文字假装画图**，必须输出 tool_call 调用此工具以生成真实图片！'
     parameters = {
         "type": "object",
         "properties": {
@@ -18,6 +18,8 @@ class GenerateImageTool(BaseTool):
         "required": ["prompt"]
     }
     require_permission = "drawing_whitelist"
+    risk_level = "low"
+    allow_forced_exec = False
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
         prompt = arguments.get("prompt", "").strip()
@@ -37,7 +39,7 @@ class GenerateImageTool(BaseTool):
 
 class SearchAcgImageTool(BaseTool):
     name = "search_acg_image"
-    description = "搜索或随机获取一张 ACG 图片，支持关键词和 R18 开关。"
+    description = '【条件触发】：当用户要求"发张图"、"来点色图/涩图"、"看图"时，**绝对禁止用文字敷衍**，必须输出 tool_call 调用此工具去图库搜索真实图片！'
     parameters = {
         "type": "object",
         "properties": {
@@ -53,6 +55,8 @@ class SearchAcgImageTool(BaseTool):
         "required": []
     }
     require_permission = "user"
+    risk_level = "low"
+    allow_forced_exec = True
 
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:
         keywords = arguments.get("keywords", "").strip()

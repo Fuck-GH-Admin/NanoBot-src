@@ -42,6 +42,7 @@ yarn-error.log*
 *.swo
 *~
 *.code-workspace
+.claude/
 
 # 系统文件
 .DS_Store

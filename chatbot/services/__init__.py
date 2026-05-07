@@ -7,12 +7,14 @@ from .image_service import ImageService
 from .drawing_service import DrawingService
 from .book_service import BookService
 from .permission_service import PermissionService
+from .rule_engine import RuleEngine, SQLiteRuleProvider
 
 _agent_srv: Optional[AgentService] = None
 _img_srv: Optional[ImageService] = None
 _draw_srv: Optional[DrawingService] = None
 _book_srv: Optional[BookService] = None
 _perm_srv: Optional[PermissionService] = None
+_rule_engine: Optional[RuleEngine] = None
 
 
 def get_agent_srv() -> AgentService:
@@ -50,6 +52,13 @@ def get_perm_srv() -> PermissionService:
     return _perm_srv
 
 
+def get_rule_engine() -> RuleEngine:
+    global _rule_engine
+    if _rule_engine is None:
+        _rule_engine = RuleEngine(SQLiteRuleProvider())
+    return _rule_engine
+
+
 # 保持向后兼容的模块级别名（import 时仍可 from ..services import agent_srv）
 agent_srv = get_agent_srv()
 img_srv = get_img_srv()
@@ -58,4 +67,4 @@ book_srv = get_book_srv()
 perm_srv = get_perm_srv()
 
 __all__ = ["get_agent_srv", "get_img_srv", "get_draw_srv", "get_book_srv", "get_perm_srv",
-           "agent_srv", "img_srv", "draw_srv", "book_srv", "perm_srv"]
+           "get_rule_engine", "agent_srv", "img_srv", "draw_srv", "book_srv", "perm_srv"]
