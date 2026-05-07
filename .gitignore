@@ -72,3 +72,4 @@ packed_for_ai/
 合并.py
 合并-按文件夹.py
 合并-总文件.py
+conftest.py
