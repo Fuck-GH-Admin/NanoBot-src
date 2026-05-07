@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import secrets
@@ -5,11 +6,14 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Set, Any
+from typing import Optional, Set, Any
 
 import yaml
+from nonebot.log import logger
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings
+
+from .schemas import CommandResult
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -83,6 +87,15 @@ class Config(BaseSettings):
 
     welcome_mode: str = "all"
 
+    force_tool_prefixes: dict[str, str] = Field(
+        default_factory=lambda: {
+            "/jm": "jm_download",
+            "#搜图": "search_acg_image",
+            "/画图": "generate_image",
+        },
+        description="硬指令前缀映射：prefix -> tool_name。匹配时跳过逻辑脑直接执行工具。",
+    )
+
     group_configs: dict[str, GroupSettings] = {}
 
 
@@ -92,31 +105,44 @@ class ConfigManager:
     def __init__(self):
         self._config = Config()
         self._lock = threading.Lock()
+        self._version: int = 0
         self._observer: Optional[Observer] = None
         self._admin_token: str = secrets.token_urlsafe(32)
         self.load_config()
         self._start_watcher()
 
+    @property
+    def version(self) -> int:
+        return self._version
+
     def get_admin_token(self) -> str:
         return self._admin_token
 
     def load_config(self):
-        """读取 config.yaml 并更新内部 Config 对象"""
+        """读取 config.yaml 并更新内部 Config 对象（深拷贝方案：仅显式出现的键被更新）"""
         if not CONFIG_FILE.exists():
             self._generate_default_yaml()
             return
 
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            raw_data = f.read()
+        try:
+            data = yaml.safe_load(raw_data) or {}
+        except yaml.YAMLError as e:
+            logger.critical(f"[Config] YAML 解析失败，保留当前配置: {e}")
+            return
 
         with self._lock:
+            temp_config = copy.deepcopy(self._config)
+
+        try:
             for key, value in data.items():
                 if key not in Config.model_fields:
                     continue
                 field_info = Config.model_fields[key]
                 target_type = field_info.annotation
 
-                # group_configs 特殊处理：从 dict 转为 GroupSettings 对象
+                # group_configs 特殊处理
                 if key == "group_configs" and isinstance(value, dict):
                     converted = {}
                     for gid, gcfg in value.items():
@@ -124,7 +150,7 @@ class ConfigManager:
                             converted[gid] = GroupSettings(**gcfg)
                         elif isinstance(gcfg, GroupSettings):
                             converted[gid] = gcfg
-                    setattr(self._config, key, converted)
+                    setattr(temp_config, key, converted)
                     continue
 
                 # 类型转换
@@ -137,7 +163,14 @@ class ConfigManager:
                         else:
                             value = set()
                     elif target_type is bool:
-                        value = bool(value)
+                        if isinstance(value, bool):
+                            converted = value
+                        elif isinstance(value, str):
+                            converted = value.strip().lower() in ("true", "1", "yes", "on")
+                        else:
+                            converted = bool(value)
+                        setattr(temp_config, key, converted)
+                        continue
                     elif target_type is float:
                         value = float(value)
                     elif target_type is int:
@@ -145,14 +178,21 @@ class ConfigManager:
                 except (ValueError, TypeError):
                     continue
 
-                setattr(self._config, key, value)
+                setattr(temp_config, key, value)
+        except Exception as e:
+            logger.critical(f"[Config] 配置应用失败，保留当前配置: {e}")
+            return
 
-    def save_config(self):
-        """将当前配置序列化并原子写回 YAML 文件"""
+        with self._lock:
+            self._config = temp_config
+        logger.info("[Config] 配置已热更新")
+
+    def save_config(self, data: dict = None):
+        """原子写入 YAML。传入 data 则直接序列化该字典，否则从当前 _config 读取。"""
         import tempfile
 
-        data = {}
-        try:
+        if data is None:
+            data = {}
             with self._lock:
                 for name, field_info in Config.model_fields.items():
                     val = getattr(self._config, name)
@@ -163,22 +203,21 @@ class ConfigManager:
                                for k, v in val.items()}
                     data[name] = val
 
-            tmp_fd, tmp_path = tempfile.mkstemp(dir=CONFIG_FILE.parent,
-                                                 prefix=CONFIG_FILE.stem + '_',
-                                                 suffix='.tmp')
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=CONFIG_FILE.parent,
+                                             prefix=CONFIG_FILE.stem + '_',
+                                             suffix='.tmp')
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception:
             try:
-                with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
-                    yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
-                os.replace(tmp_path, CONFIG_FILE)
+                os.unlink(tmp_path)
             except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-                raise
-        except Exception as e:
-            print(f"[Config] 保存配置失败: {e}")
+                pass
             raise
+
+        self._version += 1
 
     def _generate_default_yaml(self):
         """生成初始配置文件"""
@@ -260,26 +299,25 @@ class ConfigManager:
 class ConfigAPIHandler(BaseHTTPRequestHandler):
     manager: ConfigManager = None
 
+    def _json_response(self, status: int, data: dict):
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
     def _check_auth(self) -> bool:
         auth_header = self.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
-            self.send_response(403)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Missing or invalid token"}).encode())
+            self._json_response(403, CommandResult.fail("Missing or invalid token").model_dump())
             return False
         token = auth_header[7:]
         if not secrets.compare_digest(token, self.manager.get_admin_token()):
-            self.send_response(403)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Invalid token"}).encode())
+            self._json_response(403, CommandResult.fail("Invalid token").model_dump())
             return False
         return True
 
     def do_GET(self):
         if self.path in ('/', '/index.html'):
-            # 动态读取 web/index.html，注入鉴权 Token
             html_path = Path(__file__).parent / "web" / "index.html"
             try:
                 with open(html_path, 'r', encoding='utf-8') as f:
@@ -307,10 +345,8 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
                     elif name == 'group_configs':
                         val = {k: v.model_dump() if isinstance(v, GroupSettings) else v for k, v in val.items()}
                     config_data[name] = val
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(config_data, ensure_ascii=False).encode('utf-8'))
+            config_data["version"] = self.manager.version
+            self._json_response(200, config_data)
         else:
             self.send_error(404)
 
@@ -325,11 +361,10 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
         try:
             new_data = json.loads(body)
         except Exception:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
+            self._json_response(400, CommandResult.fail("Invalid JSON").model_dump())
             return
 
+        # ---- 1. 校验 & 类型转换 ----
         processed = {}
         errors = []
         for key, value in new_data.items():
@@ -358,13 +393,15 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
                     if isinstance(value, list):
                         processed[key] = value
                     elif isinstance(value, str):
-                        # 核心修复：自动剔除不小心填入的括号和引号
                         clean_val = value.replace("[", "").replace("]", "").replace('"', "").replace("'", "")
                         processed[key] = [s.strip() for s in clean_val.split(",") if s.strip()]
                     else:
                         raise ValueError("应为列表或逗号分隔字符串")
                 elif target_type is bool:
-                    processed[key] = bool(value)
+                    if isinstance(value, str):
+                        processed[key] = value.strip().lower() in ("true", "1", "yes", "on")
+                    else:
+                        processed[key] = bool(value)
                 elif target_type is float:
                     processed[key] = float(value)
                 elif target_type is int:
@@ -375,33 +412,60 @@ class ConfigAPIHandler(BaseHTTPRequestHandler):
                 errors.append(f"{key}: {e}")
 
         if errors:
-            self.send_response(400)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "; ".join(errors)}, ensure_ascii=False).encode())
+            self._json_response(400, CommandResult.fail("; ".join(errors)).model_dump())
             return
 
-        current = {}
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                current = yaml.safe_load(f) or {}
-        current.update(processed)
+        # ---- 2. 构建候选配置（不更新内存） ----
+        with self.manager._lock:
+            candidate = copy.deepcopy(self.manager._config)
+
+        for key, value in processed.items():
+            if key == "group_configs":
+                for gid, gcfg in value.items():
+                    candidate.group_configs[gid] = GroupSettings(**gcfg)
+                continue
+
+            if key in Config.model_fields:
+                field_type = Config.model_fields[key].annotation
+
+                if "Set" in str(field_type) or "set" in str(field_type):
+                    if isinstance(value, list):
+                        setattr(candidate, key, set(value))
+                    else:
+                        setattr(candidate, key, set())
+                    continue
+
+                if field_type is bool:
+                    if isinstance(value, str):
+                        value = value.strip().lower() in ("true", "1", "yes", "on")
+                    else:
+                        value = bool(value)
+
+                setattr(candidate, key, value)
+
+        # ---- 3. 先落盘，后刷新内存 ----
+        payload = {}
+        for name, field_info in Config.model_fields.items():
+            val = getattr(candidate, name)
+            if isinstance(val, set):
+                val = list(val)
+            elif name == 'group_configs':
+                val = {k: v.model_dump() if isinstance(v, GroupSettings) else v
+                       for k, v in val.items()}
+            payload[name] = val
 
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                yaml.dump(current, f, allow_unicode=True, default_flow_style=False)
-            self.manager.load_config()
+            self.manager.save_config(payload)
         except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"无法写入文件: {e}"}, ensure_ascii=False).encode())
+            logger.error(f"[Config] Web API 保存配置失败: {e}")
+            self._json_response(500, CommandResult.fail(f"保存配置失败: {e}").model_dump())
             return
 
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps({"status": "ok"}).encode())
+        # 落盘成功，才更新内存
+        with self.manager._lock:
+            self.manager._config = candidate
+
+        self._json_response(200, CommandResult.ok("配置已保存").model_dump())
 
     def log_message(self, format, *args):
         pass

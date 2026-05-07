@@ -1,7 +1,7 @@
-# src/plugins/chatbot/tools/book_tool.py
+# src/plugins/chatbot/tools/agent_tools/book_tool.py
 
 from typing import Any, Dict, List, Tuple
-from .base_tool import BaseTool
+from ..base_tool import BaseTool
 
 
 class RecommendBookTool(BaseTool):
@@ -24,7 +24,7 @@ class RecommendBookTool(BaseTool):
         # 获取书籍服务
         book_srv = context.get("book_service")
         if not book_srv:
-            from ..services.book_service import BookService
+            from ...services.book_service import BookService
             book_srv = BookService()
 
         # 获取 Bot 和会话信息
@@ -32,7 +32,7 @@ class RecommendBookTool(BaseTool):
         group_id = context.get("group_id")
         user_id = context.get("user_id")
         is_group = group_id and int(group_id) != 0
-        
+
         # 获取一本随机书
         path = book_srv.repo.get_random_book()
         if not path:
@@ -61,6 +61,7 @@ class RecommendBookTool(BaseTool):
 
 class JmDownloadTool(BaseTool):
     name = "jm_download"
+    is_write_operation = True
     description = '【条件触发】：当用户提供了一串数字ID，并要求"下载"、"看这个本子"时，必须输出 tool_call 调用此工具进行真实下载。'
     parameters = {
         "type": "object",
@@ -88,14 +89,14 @@ class JmDownloadTool(BaseTool):
 
         book_srv = context.get("book_service")
         if not book_srv:
-            from ..services.book_service import BookService
+            from ...services.book_service import BookService
             book_srv = BookService()
 
         bot = context.get("bot")
         group_id = context.get("group_id")
         user_id = context.get("user_id")
         is_group = group_id and int(group_id) != 0
-        
+
         target_id = int(group_id) if is_group else int(user_id)
         message_type = "group" if is_group else "private"
 

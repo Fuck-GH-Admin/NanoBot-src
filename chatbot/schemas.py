@@ -52,3 +52,18 @@ class ChatRequestPayload(BaseModel):
     memorySnapshot: MemorySnapshot
     tools: List[Dict[str, Any]] = []
     context: Dict[str, Any] = {}
+
+
+class CommandResult(BaseModel):
+    """管理指令统一返回结构"""
+    success: bool
+    message: str = ""
+    data: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def ok(cls, message: str = "", **kwargs) -> "CommandResult":
+        return cls(success=True, message=message, data=kwargs or None)
+
+    @classmethod
+    def fail(cls, message: str = "", **kwargs) -> "CommandResult":
+        return cls(success=False, message=message, data=kwargs or None)

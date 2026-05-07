@@ -1,7 +1,7 @@
-# src/plugins/chatbot/tools/system_tool.py
+# src/plugins/chatbot/tools/agent_tools/system_tool.py
 
 from typing import Any, Dict, List, Tuple
-from .base_tool import BaseTool
+from ..base_tool import BaseTool
 
 
 class MarkTaskCompleteTool(BaseTool):

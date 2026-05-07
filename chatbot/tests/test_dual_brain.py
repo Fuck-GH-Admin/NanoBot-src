@@ -1,11 +1,12 @@
 """
-端到端测试：双脑分工架构
+端到端测试：双脑分工架构（控制面/数据面分离版）
 覆盖场景：
-  1. 双脑开启 + 工具调用 → DB 记录顺序 user → assistant(tool_calls) → tool → assistant(final)
+  1. 双脑开启 + 工具调用 → chat_history 仅记录 user → assistant(final)，工具日志写入 tool_execution_log
   2. 纯聊天（无工具）→ 不产生 tool_calls
-  3. system_welcome 短路 → chat_history 无污染
+  3. source_type="system" 短路 → chat_history 无污染
   4. enable_dual_brain=False → 回退单脑模式
   5. 逻辑循环去重 → 相同工具调用不死循环
+  6. 硬指令前缀路由 → 跳过逻辑脑直接执行工具
 """
 
 import asyncio
@@ -40,6 +41,7 @@ def _make_config(**overrides):
     cfg.entity_relation_enabled = False
     cfg.semantic_lorebook_enabled = False
     cfg.token_arbitration_enabled = False
+    cfg.force_tool_prefixes = {}
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
@@ -89,15 +91,20 @@ def _mock_httpx_post(responses):
     return mock
 
 
-def _mock_repo(messages_log=None):
-    """构建 MemoryRepository mock，记录所有 add_message 调用。"""
+def _mock_repo(messages_log=None, tool_log=None):
+    """构建 MemoryRepository mock，记录所有 add_message 和 insert_tool_log 调用。"""
     repo = MagicMock()
     log = messages_log if messages_log is not None else []
+    tlog = tool_log if tool_log is not None else []
 
     async def _add_message(**kwargs):
         log.append(kwargs)
 
+    async def _insert_tool_log(**kwargs):
+        tlog.append(kwargs)
+
     repo.add_message = AsyncMock(side_effect=_add_message)
+    repo.insert_tool_log = AsyncMock(side_effect=_insert_tool_log)
     repo.get_recent_messages = AsyncMock(return_value=[])
     repo.get_active_profiles = AsyncMock(return_value={})
     repo.get_group_summary = AsyncMock(return_value="")
@@ -121,7 +128,7 @@ def _mock_rule_engine(matched_rule=None):
 
 
 def _mock_registry(tool_result=("工具执行成功", [])):
-    """构建 ToolRegistry mock。"""
+    """构建 AgentToolRegistry mock。"""
     registry = MagicMock()
     registry.get_all_schemas.return_value = []
     registry.execute_tool = AsyncMock(return_value=tool_result)
@@ -149,15 +156,11 @@ def _base_context():
 async def test_dual_brain_with_tool_call():
     """
     场景 1: 双脑开启 + 工具调用
-    验证 DB 记录顺序: user → assistant(tool_calls) → tool → assistant(final)
+    验证 chat_history 仅记录 user → assistant(final)，
+    工具日志通过 insert_tool_log 写入 tool_execution_log。
     """
     tc = _tool_call("search_acg_image", {"keyword": "二次元"}, tc_id="tc_001")
 
-    # Phase 1 逻辑循环:
-    #   call 1 → tool_calls → 执行工具 → 追加结果
-    #   call 2 → 无 tool_calls → 退出循环
-    # Phase 2 人格渲染:
-    #   call 3 → 最终文本
     http_responses = [
         (200, _llm_response("", [tc])),           # Phase 1 call 1 (logic, with tools)
         (200, _llm_response("", None)),            # Phase 1 call 2 (logic, no tools → exit loop)
@@ -165,15 +168,16 @@ async def test_dual_brain_with_tool_call():
     ]
 
     db_log = []
+    tool_log = []
     config = _make_config()
-    repo = _mock_repo(db_log)
+    repo = _mock_repo(db_log, tool_log)
     rule_engine = _mock_rule_engine()
     registry = _mock_registry(("找到图片: /img/test.jpg", ["/img/test.jpg"]))
 
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -196,14 +200,18 @@ async def test_dual_brain_with_tool_call():
     )
     assert len(result["images"]) == 1
 
-    # 验证 DB 记录顺序
+    # 验证 chat_history 只有 user + final assistant（无 tool_calls、无 tool 消息）
     roles = [r["role"] for r in db_log]
     assert roles[0] == "user", "第一条应为 user"
-    assert roles[1] == "assistant", "第二条应为 assistant (tool_calls)"
-    assert db_log[1].get("tool_calls") is not None, "assistant 消息应含 tool_calls"
-    assert roles[2] == "tool", "第三条应为 tool 结果"
-    assert roles[3] == "assistant", "第四条应为 assistant (最终回复，无 tool_calls)"
-    assert db_log[3].get("tool_calls") is None, "最终 assistant 不应含 tool_calls"
+    assert roles[1] == "assistant", "第二条应为 assistant (最终回复)"
+    assert db_log[1].get("tool_calls") is None, "最终 assistant 不应含 tool_calls"
+    assert len(db_log) == 2, f"chat_history 应只有 2 条记录，实际 {len(db_log)} 条"
+    assert "tool" not in roles, "tool 消息不应写入 chat_history"
+
+    # 验证工具日志通过 insert_tool_log 写入
+    assert len(tool_log) >= 1, "应有至少 1 条工具审计日志"
+    assert tool_log[0]["tool_name"] == "search_acg_image"
+    assert tool_log[0]["trigger"] == "llm"
 
 
 @pytest.mark.asyncio
@@ -226,7 +234,7 @@ async def test_pure_chat_no_tool_calls():
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -254,7 +262,7 @@ async def test_pure_chat_no_tool_calls():
 @pytest.mark.asyncio
 async def test_system_welcome_no_db_pollution():
     """
-    场景 3: system_welcome 短路
+    场景 3: source_type="system" 短路
     验证 chat_history 表无污染（不调用 add_message）。
     """
     http_responses = [
@@ -270,7 +278,7 @@ async def test_system_welcome_no_db_pollution():
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -284,10 +292,11 @@ async def test_system_welcome_no_db_pollution():
         svc.semantic_lorebook = None
 
         ctx = _base_context()
+        ctx["source_type"] = "system"
         result = await svc.run_agent("system_welcome", "欢迎新成员加入群聊", ctx)
 
     assert "欢迎" in result["text"]
-    assert len(db_log) == 0, f"system_welcome 不应写入 DB，但写入了 {len(db_log)} 条"
+    assert len(db_log) == 0, f"system 事件不应写入 DB，但写入了 {len(db_log)} 条"
 
 
 @pytest.mark.asyncio
@@ -309,7 +318,7 @@ async def test_single_brain_fallback():
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -354,7 +363,7 @@ async def test_logic_loop_dedup():
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -377,7 +386,7 @@ async def test_logic_loop_dedup():
 @pytest.mark.asyncio
 async def test_tool_result_truncation():
     """
-    场景 6: 工具结果截断到 300 字符。
+    场景 6: 工具结果在 tool_execution_log 中截断到 300 字符。
     """
     long_result = "A" * 500
     tc = _tool_call("search_acg_image", {"keyword": "test"}, tc_id="tc_trunc")
@@ -389,15 +398,16 @@ async def test_tool_result_truncation():
     ]
 
     db_log = []
+    tool_log = []
     config = _make_config()
-    repo = _mock_repo(db_log)
+    repo = _mock_repo(db_log, tool_log)
     rule_engine = _mock_rule_engine()
     registry = _mock_registry((long_result, []))
 
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -412,11 +422,12 @@ async def test_tool_result_truncation():
 
         result = await svc.run_agent("99999", "搜图 test", _base_context())
 
-    # 工具结果应被截断到 300 字符（在 system_notification 中）
-    # 但 DB 中存储的是完整结果
-    tool_records = [r for r in db_log if r["role"] == "tool"]
-    assert len(tool_records) >= 1
-    assert tool_records[0]["content"] == long_result, "DB 应存完整结果"
+    # 工具结果应通过 insert_tool_log 写入，且截断到 300 字符
+    assert len(tool_log) >= 1, "应有工具审计日志"
+    assert tool_log[0]["result_summary"] == long_result[:300], "result_summary 应截断到 300 字符"
+    # chat_history 中不应有 tool 消息
+    tool_in_db = [r for r in db_log if r["role"] == "tool"]
+    assert len(tool_in_db) == 0, "tool 消息不应写入 chat_history"
 
 
 @pytest.mark.asyncio
@@ -450,10 +461,9 @@ async def test_compile_logic_prompt_no_roleplay():
 @pytest.mark.asyncio
 async def test_compile_actor_prompt_with_notification():
     """
-    场景 8: compile_actor_prompt 的 system_notification 追加为 USER 消息。
+    场景 8: compile_actor_prompt 的 system_notification 注入为 SystemBlock（SYSTEM 角色）。
     """
     from chatbot.services.prompt_adapter import PromptAdapter
-    from chatbot.engine import MessageRole
 
     adapter = PromptAdapter()
 
@@ -465,11 +475,12 @@ async def test_compile_actor_prompt_with_notification():
         messages, snapshot, context, system_notification="工具执行完毕",
     )
 
-    # 最后一条消息应为 USER 角色，包含系统通知
-    last_msg = result[-1]
-    assert last_msg["role"] == "user", f"最后一条应为 user 角色，实际为 {last_msg['role']}"
-    assert "系统后台通知" in last_msg["content"], "应含系统通知标记"
-    assert "工具执行完毕" in last_msg["content"], "应含通知内容"
+    # system_notification 应作为 system 角色消息注入（SystemBlock）
+    system_msgs = [m for m in result if m["role"] == "system"]
+    assert len(system_msgs) >= 1, "应有至少 1 条 system 消息"
+    combined = " ".join(m["content"] for m in system_msgs)
+    assert "SYSTEM_TOOL_RESULT" in combined, "应含 SYSTEM_TOOL_RESULT 标记"
+    assert "工具执行完毕" in combined, "应含通知内容"
 
 
 def test_build_safe_history_drops_toolcall_assistant():
@@ -524,7 +535,7 @@ async def test_logic_loop_exit_on_error():
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -545,9 +556,52 @@ async def test_logic_loop_exit_on_error():
 
 
 @pytest.mark.asyncio
-async def test_forced_id_unique():
+async def test_handle_forced_tool():
     """
-    连续两次触发兜底执行，forced_id 互不相同。
+    硬指令前缀路由：/jm 350234 跳过逻辑脑直接执行工具。
+    """
+    from chatbot.services.agent_service import AgentService
+
+    tool_log = []
+    svc = AgentService.__new__(AgentService)
+    svc.registry = MagicMock()
+    svc.registry._tools = {}
+    svc.repo = MagicMock()
+    svc.repo.insert_tool_log = AsyncMock(side_effect=lambda **kw: tool_log.append(kw))
+
+    # 注册 jm_download 工具
+    mock_tool = MagicMock()
+    mock_tool.parameters = {"properties": {"ids": {"type": "array"}}}
+    svc.registry._tools["jm_download"] = mock_tool
+    svc.registry.get_all_schemas.return_value = [
+        {"function": {"name": "jm_download"}}
+    ]
+    svc.registry.execute_tool = AsyncMock(return_value=("下载完成", []))
+
+    cfg = _make_config()
+    cfg.force_tool_prefixes = {"/jm": "jm_download"}
+
+    with patch("chatbot.services.agent_service.plugin_config", cfg):
+        ctx = _base_context()
+        result = await svc._handle_forced_tool("/jm 350234", ctx, "session_1")
+
+    assert result is not None, "应匹配 /jm 前缀"
+    assert "system_notification" in result
+    assert "SYSTEM_TOOL_RESULT" in result["system_notification"]
+    # 验证工具被正确调用
+    svc.registry.execute_tool.assert_called_once_with(
+        "jm_download", {"ids": ["350234"]}, ctx
+    )
+    # 验证审计日志
+    assert len(tool_log) == 1
+    assert tool_log[0]["trigger"] == "forced_shortcut"
+    assert tool_log[0]["tool_name"] == "jm_download"
+
+
+@pytest.mark.asyncio
+async def test_handle_forced_tool_no_match():
+    """
+    非硬指令前缀的消息不匹配，返回 None。
     """
     from chatbot.services.agent_service import AgentService
 
@@ -555,35 +609,15 @@ async def test_forced_id_unique():
     svc.registry = MagicMock()
     svc.registry._tools = {}
     svc.repo = MagicMock()
-    svc.rule_repo = MagicMock()
 
-    # 注册一个低风险工具
-    mock_tool = MagicMock()
-    mock_tool.risk_level = "low"
-    mock_tool.allow_forced_exec = True
-    svc.registry._tools["search_acg_image"] = mock_tool
-    svc.registry.execute_tool = AsyncMock(return_value=("结果", []))
+    cfg = _make_config()
+    cfg.force_tool_prefixes = {"/jm": "jm_download"}
 
-    svc.repo.add_message = AsyncMock()
-    svc.rule_repo.increment_hit_count = AsyncMock()
+    with patch("chatbot.services.agent_service.plugin_config", cfg):
+        ctx = _base_context()
+        result = await svc._handle_forced_tool("你好呀", ctx, "session_1")
 
-    matched_rule = {"rule_id": "r001", "tool_name": "search_acg_image", "keyword": "测试"}
-
-    ids = []
-    for _ in range(2):
-        ctx = {"_matched_rule": matched_rule, "_tool_executed": False}
-        tool_logs = []
-        images = []
-        logic_msgs = []
-        await svc._try_forced_exec(ctx, "测试", "group_1", tool_logs, images, logic_msgs)
-        # 从伪造的 assistant 消息中提取 forced_id
-        for msg in logic_msgs:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                ids.append(msg["tool_calls"][0]["id"])
-                break
-
-    assert len(ids) == 2, f"应生成 2 个 forced_id，实际 {len(ids)}"
-    assert ids[0] != ids[1], f"forced_id 应唯一，但都是 '{ids[0]}'"
+    assert result is None, "不匹配前缀应返回 None"
 
 
 @pytest.mark.asyncio
@@ -611,7 +645,7 @@ async def test_system_welcome_snapshot_injection():
     with patch("chatbot.services.agent_service.plugin_config", config), \
          patch("chatbot.services.agent_service.MemoryRepository", return_value=repo), \
          patch("chatbot.services.agent_service.RuleEngine", return_value=rule_engine), \
-         patch("chatbot.services.agent_service.ToolRegistry", return_value=registry), \
+         patch("chatbot.services.agent_service.AgentToolRegistry", return_value=registry), \
          patch("chatbot.services.agent_service.create_semantic_lorebook", return_value=None):
 
         from chatbot.services.agent_service import AgentService
@@ -624,10 +658,12 @@ async def test_system_welcome_snapshot_injection():
         svc.http_client.aclose = AsyncMock()
         svc.semantic_lorebook = None
 
-        result = await svc.run_agent("system_welcome", "欢迎新成员", _base_context())
+        ctx = _base_context()
+        ctx["source_type"] = "system"
+        result = await svc.run_agent("system_welcome", "欢迎新成员", ctx)
 
     assert "欢迎" in result["text"]
-    assert len(db_log) == 0, "system_welcome 不应写入 DB"
+    assert len(db_log) == 0, "system 事件不应写入 DB"
     # 验证 get_memory_snapshot 被调用
     repo.get_memory_snapshot.assert_called_once()
 

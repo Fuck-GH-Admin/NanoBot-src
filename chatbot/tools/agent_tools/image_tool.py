@@ -1,11 +1,12 @@
-# src/plugins/chatbot/tools/image_tool.py
+# src/plugins/chatbot/tools/agent_tools/image_tool.py
 
 from typing import Any, Dict, List, Tuple
-from .base_tool import BaseTool
+from ..base_tool import BaseTool
 
 
 class GenerateImageTool(BaseTool):
     name = "generate_image"
+    is_write_operation = True
     description = '【条件触发】：当用户明确要求"画一张图"、"生成一张XX"时，**绝对禁止用文字假装画图**，必须输出 tool_call 调用此工具以生成真实图片！'
     parameters = {
         "type": "object",
@@ -29,7 +30,7 @@ class GenerateImageTool(BaseTool):
         # 从上下文获取绘图服务
         drawing_srv = context.get("drawing_service")
         if not drawing_srv:
-            from ..services.drawing_service import DrawingService
+            from ...services.drawing_service import DrawingService
             drawing_srv = DrawingService()
 
         path, msg = await drawing_srv.generate_image(prompt, context["user_id"])
@@ -66,7 +67,7 @@ class SearchAcgImageTool(BaseTool):
 
         image_srv = context.get("image_service")
         if not image_srv:
-            from ..services.image_service import ImageService
+            from ...services.image_service import ImageService
             image_srv = ImageService()
 
         path, info = await image_srv.get_image(keywords, actual_r18)

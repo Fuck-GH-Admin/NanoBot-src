@@ -17,6 +17,7 @@ class BaseTool(ABC):
     require_permission: str = "user"  # user, drawing_whitelist, admin 等
     risk_level: str = "low"           # low / high
     allow_forced_exec: bool = True    # 是否允许规则兜底执行
+    is_write_operation: bool = False  # 是否为状态变更操作（仅写操作记入审计日志）
 
     @abstractmethod
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, List[str]]:

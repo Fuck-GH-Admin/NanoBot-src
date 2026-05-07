@@ -78,7 +78,7 @@ async def handle_increase(bot: Bot, event: GroupIncreaseNoticeEvent):
     if plugin_config.welcome_mode not in ["hello", "all"]: return
     if not await check_group(str(event.group_id)): return
     try:
-        ctx = {"bot": bot, "user_id": str(event.user_id), "group_id": event.group_id, "is_admin": False, "allow_r18": False}
+        ctx = {"bot": bot, "user_id": str(event.user_id), "group_id": event.group_id, "is_admin": False, "allow_r18": False, "source_type": "system"}
         result = await agent_srv.run_agent("system_welcome",
             "用可爱温暖的语气欢迎一位新朋友加入群聊，30字以内，可以加表情", ctx)
         reply = result.get("text", "欢迎新朋友加入～")
@@ -97,7 +97,7 @@ async def handle_decrease(bot: Bot, event: GroupDecreaseNoticeEvent):
             info = await bot.get_group_member_info(group_id=event.group_id, user_id=event.user_id)
             name = info.get("nickname", "群友")
         except: pass
-        ctx = {"bot": bot, "user_id": str(event.user_id), "group_id": event.group_id, "is_admin": False, "allow_r18": False}
+        ctx = {"bot": bot, "user_id": str(event.user_id), "group_id": event.group_id, "is_admin": False, "allow_r18": False, "source_type": "system"}
         result = await agent_srv.run_agent("system_welcome",
             f"用有点伤感但不过分的语气说再见，提到“{name}”，25字以内", ctx)
         reply = result.get("text", f"{name} 离开了大家庭...常回来看看哦")

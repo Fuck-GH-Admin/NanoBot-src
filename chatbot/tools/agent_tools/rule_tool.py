@@ -1,12 +1,12 @@
-# src/plugins/chatbot/tools/rule_tool.py
+# src/plugins/chatbot/tools/agent_tools/rule_tool.py
 
 from typing import Any, Dict, List, Tuple
 
 from nonebot.log import logger
 
-from .base_tool import BaseTool
-from ..utils.keyword_utils import normalize_keywords, compute_keywords_hash
-from ..repositories.rule_repo import RuleRepository
+from ..base_tool import BaseTool
+from ...utils.keyword_utils import normalize_keywords, compute_keywords_hash
+from ...repositories.rule_repo import RuleRepository
 
 # ── 可学习工具 & 高风险黑名单 ─────────────────────────────────
 LEARNABLE_TOOLS = ["jm_download", "search_acg_image", "recommend_book", "generate_image"]
@@ -41,6 +41,7 @@ class LearnRuleTool(BaseTool):
     """管理员教学工具：创建或覆盖动态暗号规则。"""
 
     name = "learn_rule"
+    is_write_operation = True
     description = (
         "教我一个新的暗号规则。当用户说出特定关键词时，我会自动调用对应工具。"
         "仅管理员可用。"
@@ -203,6 +204,7 @@ class ForgetRuleTool(BaseTool):
     """管理员遗忘工具：删除已有规则。"""
 
     name = "forget_rule"
+    is_write_operation = True
     description = "删除一条已有的暗号规则。仅管理员可用。"
     parameters = {
         "type": "object",

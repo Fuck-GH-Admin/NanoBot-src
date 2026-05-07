@@ -194,3 +194,22 @@ class RuleChangelog(Base):
 
     def __repr__(self) -> str:
         return f"<RuleChangelog id={self.id} action={self.action} rule={self.rule_id}>"
+
+
+class ToolExecutionLog(Base):
+    """工具执行审计日志：每次工具调用一行，用于溯源和调试"""
+    __tablename__ = "tool_execution_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    request_id: Mapped[str] = mapped_column(String(32))
+    step: Mapped[int] = mapped_column(Integer)
+    trigger: Mapped[str] = mapped_column(String(16))  # llm / forced_shortcut
+    tool_name: Mapped[str] = mapped_column(String(32))
+    arguments: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_utc_now_iso)
+
+    def __repr__(self) -> str:
+        return f"<ToolExecutionLog id={self.id} tool={self.tool_name} session={self.session_id}>"

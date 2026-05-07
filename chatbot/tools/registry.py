@@ -1,6 +1,6 @@
 # src/plugins/chatbot/tools/registry.py
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from nonebot.log import logger
 
 from .base_tool import BaseTool
@@ -19,6 +19,10 @@ class ToolRegistry:
     def unregister(self, name: str) -> None:
         if name in self._tools:
             del self._tools[name]
+
+    def get_tool(self, name: str) -> Optional[BaseTool]:
+        """按名称获取已注册工具，不存在返回 None"""
+        return self._tools.get(name)
 
     def get_all_schemas(self, permissions: Any, user_id: str, is_admin: bool = False) -> List[Dict]:
         schemas = []
@@ -86,3 +90,13 @@ class ToolRegistry:
         except Exception as e:
             logger.error(f"[ToolRegistry] 工具 '{name}' 执行异常: {e}")
             return f"工具执行出错：{str(e)}", []
+
+
+class AgentToolRegistry(ToolRegistry):
+    """数据面注册表：LLM 可见工具"""
+    pass
+
+
+class SystemToolRegistry(ToolRegistry):
+    """控制面注册表：LLM 绝对不可见"""
+    pass

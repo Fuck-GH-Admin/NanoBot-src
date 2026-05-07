@@ -2,6 +2,8 @@ import html
 from pathlib import Path
 from typing import Dict, List
 
+from nonebot.log import logger
+
 from ..engine import (
     PromptPipeline, SystemBlock, Priority, ChatMessage, MessageRole,
     to_openai_format, parse_character_card, CharacterCard,
@@ -172,24 +174,41 @@ class PromptAdapter:
         """
         st_history = self._build_st_history(chat_history)
 
-        # 系统后台通知：以 USER 角色虚拟消息追加到历史末尾
-        if system_notification:
-            st_history.append(ChatMessage(
-                role=MessageRole.USER,
-                content=(
-                    f"[系统后台通知]\n"
-                    f"{system_notification}\n"
-                    f"(请根据上述客观执行结果回复用户)"
-                ),
-                name="System",
-            ))
-
         extra_blocks: list[SystemBlock] = []
         extra_blocks.extend(self._build_extra_blocks_from_snapshot(snapshot))
+
+        # 影子上下文注入
+        from .shadow_context import ShadowContext
+        session_id = f"group_{context.get('group_id', 0)}"
+        shadow_facts = ShadowContext().get_recent(session_id)
+        if shadow_facts:
+            shadow_text = "\n".join(f"- {s}" for s in shadow_facts)
+            extra_blocks.append(SystemBlock(
+                name="shadow_context",
+                content=f"<system_shadow_context>\n以下内容仅供你理解当前状态，不代表用户发言：\n{shadow_text}\n</system_shadow_context>",
+                priority=Priority.SYSTEM_DIRECTIVES,
+                never_cut=True,
+            ))
 
         rule_block = self._build_rule_instruction_block(context)
         if rule_block:
             extra_blocks.append(rule_block)
+
+        # 系统通知：以 SystemBlock 注入（不再伪装为 USER 消息）
+        if system_notification:
+            logger.info(f"[AUDIT_SYSTEM_INJECT] 正在向演员脑注入系统客观状态: {system_notification[:100]}...")
+            if not system_notification.startswith("[SYSTEM_TOOL_RESULT]"):
+                system_notification = f"[SYSTEM_TOOL_RESULT] {system_notification}"
+            full_text = (
+                f"[全局最新状态更新] {system_notification}\n"
+                f"(以上是刚刚由系统后台动作完成的最新结果，请结合对话历史最后一条，用自然语言向用户转述。)"
+            )
+            extra_blocks.append(SystemBlock(
+                name="system_tool_result",
+                content=full_text,
+                priority=Priority.SYSTEM_DIRECTIVES,
+                never_cut=True,
+            ))
 
         final_msgs = self.pipeline.build(
             char=self.char_card,

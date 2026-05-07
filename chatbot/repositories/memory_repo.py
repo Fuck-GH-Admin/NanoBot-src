@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from nonebot.log import logger
 
-from .models import Base, ChatHistory, GroupMemory, UserTrait, CompactionJournal, Entity, Relation
+from .models import Base, ChatHistory, GroupMemory, UserTrait, CompactionJournal, Entity, Relation, ToolExecutionLog
 
 
 def _utc_now_iso() -> str:
@@ -887,3 +887,66 @@ class MemoryRepository:
             ).limit(1)
             result = await session.execute(stmt)
             return result.scalar_one_or_none() is not None
+
+    # ------------------------------------------------------------------
+    # 工具执行审计日志 (ToolExecutionLog)
+    # ------------------------------------------------------------------
+
+    async def insert_tool_log(
+        self,
+        session_id: str,
+        request_id: str,
+        step: int,
+        trigger: str,
+        tool_name: str,
+        arguments: dict | None = None,
+        result_summary: str = "",
+        error: str | None = None,
+    ) -> None:
+        """记录一次工具执行到审计日志表。"""
+        try:
+            async with self._get_session() as session:
+                session.add(ToolExecutionLog(
+                    session_id=session_id,
+                    request_id=request_id,
+                    step=step,
+                    trigger=trigger,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result_summary=result_summary[:2000],
+                    error=error[:2000] if error else None,
+                ))
+                await session.commit()
+        except Exception as e:
+            logger.error(f"[MemoryRepo] 写入工具日志失败: {e}")
+
+    async def get_recent_tool_logs(
+        self,
+        session_id: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """查询最近的突变日志。"""
+        async with self._get_session() as session:
+            stmt = (
+                select(ToolExecutionLog)
+                .where(ToolExecutionLog.session_id == session_id)
+                .order_by(ToolExecutionLog.id.desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "session_id": r.session_id,
+                    "request_id": r.request_id,
+                    "step": r.step,
+                    "trigger": r.trigger,
+                    "tool_name": r.tool_name,
+                    "arguments": r.arguments,
+                    "result_summary": r.result_summary,
+                    "error": r.error,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]

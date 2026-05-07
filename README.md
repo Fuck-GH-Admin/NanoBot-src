@@ -1,152 +1,141 @@
-# Chatbot B — Multi-Agent 双端协同聊天机器人
+# Chatbot B — 基于微内核架构的 QQ 智能对话机器人
 
-> **Python (NoneBot2) 负责逻辑编排 · Node.js (Express) 负责提示词编译与 LLM 调用**
+> **版本**：V3（Alconna 协议 + 控制面/数据面物理隔离 + 影子上下文 + 突变日志）
 
-一个面向 QQ 群聊的工业级 AI 聊天机器人系统，采用双进程协作架构，具备完整的记忆管理、知识图谱、工具调用和安全防护能力。
-
----
-
-## 核心特性
-
-| 特性 | 说明 |
-|------|------|
-| **双端强类型契约** | Python `Pydantic` + Node.js `Zod` 双重校验，CI 自动检测契约漂移 |
-| **SQLite 实体关系记忆** | 六张核心表支撑对话历史、群友画像、知识图谱三元组、压缩任务流水 |
-| **时间衰减知识图谱** | 半衰期公式 `confidence × 0.5^(age/half_life)` 自动淡化陈旧关系 |
-| **高可用任务队列** | `asyncio.Queue` + `CompactionJournal` 持久化 + 指数退避重试 + 死信追踪 |
-| **智能循环终止** | Jaccard 重复检测 + `mark_task_complete` 系统工具 + `max_loops` 兜底 |
-| **语义向量检索** | FAISS + DeepSeek Embedding API，世界书从纯关键词升级为语义+关键词混合召回 |
-| **Token 预算仲裁** | 按优先级裁剪系统区块（世界知识→群组记忆→关系图→历史），保证不超限 |
-| **安全 XML 模板** | 所有动态变量自动转义，防止提示词注入 |
-| **零信任管理面板** | Bearer Token 鉴权 + 阅后即焚，每次重启自动轮换 |
-| **灰度特性开关** | 6 个 Feature Flag 控制各子系统的启用/禁用 |
+一个运行于 **NoneBot2** 框架之上的 QQ 群聊/私聊智能对话系统。采用**微内核（Microkernel）设计哲学**，将控制面（Control Plane）与数据面（Data Plane）在物理层面进行隔离，确保大语言模型（LLM）绝对无法越权调用系统管理工具。
 
 ---
 
-## 系统拓扑
+## 核心架构特征
+
+### 微内核设计：控制面与数据面隔离
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Python (NoneBot2)                       │
-│  ┌──────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │ Matchers │→│ AgentService  │→│   MemoryService     │    │
-│  │ (事件入口)│  │ (ReAct 循环)  │  │ (后台压缩队列)      │    │
-│  └──────────┘  └──────┬───────┘  └────────────────────┘    │
-│                       │ HTTP POST                           │
-│                       ▼                                      │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │              Node.js (Express :3010)                    │ │
-│  │  ┌─────────────┐  ┌──────────┐  ┌──────────────────┐  │ │
-│  │  │TavernCoreV2 │→│lorebook  │→│DeepSeekTavernClient│  │ │
-│  │  │(Prompt编译)  │  │(世界书扫描)│  │  (LLM 调用)       │  │ │
-│  │  └─────────────┘  └──────────┘  └──────────────────┘  │ │
-│  └────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-         │                                    │
-         ▼                                    ▼
-    ┌─────────┐                      ┌──────────────┐
-    │ SQLite  │                      │ DeepSeek API │
-    └─────────┘                      └──────────────┘
+│                      NoneBot2 事件循环                       │
+├──────────────────────────┬──────────────────────────────────┤
+│     控制面 Control Plane  │      数据面 Data Plane           │
+│  ┌─────────────────────┐ │  ┌────────────────────────────┐  │
+│  │  admin_hard.py      │ │  │  chat_entry.py             │  │
+│  │  (Alconna 强指令)    │ │  │  (消息入口 + 触发判定)      │  │
+│  └────────┬────────────┘ │  └────────────┬───────────────┘  │
+│           ▼              │               ▼                  │
+│  ┌─────────────────────┐ │  ┌────────────────────────────┐  │
+│  │ SystemToolRegistry  │ │  │  AgentToolRegistry         │  │
+│  │ (LLM 绝对不可见)     │ │  │  (LLM 可见，受权限过滤)    │  │
+│  │                     │ │  │                            │  │
+│  │ · BanUserTool       │ │  │ · GenerateImageTool        │  │
+│  │                     │ │  │ · SearchAcgImageTool       │  │
+│  │                     │ │  │ · RecommendBookTool        │  │
+│  │                     │ │  │ · JmDownloadTool           │  │
+│  │                     │ │  │ · LearnRuleTool            │  │
+│  │                     │ │  │ · ForgetRuleTool           │  │
+│  │                     │ │  │ · MarkTaskCompleteTool     │  │
+│  └─────────────────────┘ │  └────────────────────────────┘  │
+└──────────────────────────┴──────────────────────────────────┘
 ```
 
-**职责边界**：
-- **Python 端**：事件监听、权限控制、工具执行、记忆压缩、实体关系提取、数据库持久化
-- **Node 端**：角色卡渲染、世界书扫描、宏替换、Token 预算仲裁、LLM API 调用
+**安全保证**：`SystemToolRegistry` 与 `AgentToolRegistry` 是两个独立的注册表实例，物理隔离于不同的目录（`tools/system_tools/` vs `tools/agent_tools/`）。`BanUserTool` 等控制面工具的 Schema **永远不会**出现在 LLM 的 tools 定义中，因此 LLM 在技术上无法生成对应的 `tool_call`。
+
+### 双脑协作架构
+
+| 脑 | 职责 | 工具访问 | Prompt 特征 |
+|----|------|---------|------------|
+| **逻辑脑（Logic Brain）** | 意图分析、工具调度 | 可调用 AgentToolRegistry 中的工具 | 极简指令，无角色扮演设定 |
+| **演员脑（Actor Brain）** | 人格渲染、角色扮演 | 无工具访问 | 完整角色卡、世界书、影子上下文 |
+
+流程：逻辑脑执行工具 → 将结果通过 `system_notification` 注入演员脑 → 演员脑以角色人格向用户转述结果。
+
+### 影子上下文（Shadow Context）
+
+控制面操作（如禁言）不会写入 `chat_history`（`block=True` 阻断传播），但演员脑需要感知这些操作以避免认知割裂。`ShadowContext` 是一个基于 `TTLCache` 的单例短期事实队列：
+
+- 每次控制面操作后，事实被推入对应 session 的队列
+- 演员脑编译 Prompt 时，影子上下文以 `never_cut=True` 的 `SystemBlock` 注入
+- 事实自动过期：24 小时无访问即淘汰，单 session 最多保留 5 条
+
+### 突变日志（Mutation Logs）
+
+并非所有工具调用都值得记录。只有**状态变更操作**（`is_write_operation = True`）才写入 `tool_execution_log` 审计表：
+
+| 工具 | 分类 | is_write_operation | 说明 |
+|------|------|:------------------:|------|
+| `ban_user` | 控制面 | ✅ | 改变用户禁言状态 |
+| `generate_image` | 数据面 | ✅ | 消耗资源，产生文件 |
+| `jm_download` | 数据面 | ✅ | 消耗资源，产生文件 |
+| `learn_rule` / `forget_rule` | 数据面 | ✅ | 改变规则配置 |
+| `search_acg_image` | 数据面 | ❌ | 只读查询 |
+| `recommend_book` | 数据面 | ❌ | 只读查询 |
+| `mark_task_complete` | 数据面 | ❌ | 内部循环信号 |
 
 ---
 
-## 快速启动
+## 强指令系统（Alconna 协议）
 
-### 1. 环境要求
+所有管理指令通过 `nonebot-plugin-alconna` 进行结构化解析，**不依赖正则表达式**。指令匹配后设置 `block=True`，指令文本**绝对不会**泄漏到 `chat_entry` 的消息处理链路中。
+
+| 指令 | 语法 | 别名 | 权限 | 说明 |
+|------|------|------|------|------|
+| 退群 | `退群` | `leave` | 管理员 | Bot 退出当前群聊 |
+| 调整活跃度 | `调整活跃度 <概率>` | `活跃度`、`插嘴概率` | 管理员 | 设置随机插嘴概率（`0.5` 或 `50%`） |
+| 潜水模式 | `潜水模式 <开启\|关闭>` | — | 管理员 | 切换非 @ 消息记录模式 |
+| 授权画图 | `授权画图 @用户1 @用户2 ...` | `开启画图白名单` | 管理员 | 为用户解锁画图功能 |
+| 禁言 | `禁言 @用户 <秒数>` | `ban` | 管理员 | 禁言指定用户（默认 600 秒） |
+
+### 硬指令前缀（短路路由）
+
+以下前缀命中时，跳过逻辑脑 LLM 推理，直接执行对应工具：
+
+| 前缀 | 映射工具 |
+|------|---------|
+| `/jm` | `jm_download` |
+| `#搜图` | `search_acg_image` |
+| `/画图` | `generate_image` |
+
+---
+
+## 快速开始
+
+### 环境要求
 
 - Python 3.11+
-- Node.js 20+
-- SQLite (随 Python 自动创建)
+- SQLite（随 Python 自动创建）
 
-### 2. 配置
-
-复制并编辑配置文件：
+### 安装依赖
 
 ```bash
-cp config_bot_base.yaml.example config_bot_base.yaml
+pip install -e .
 ```
 
-关键配置项：
+依赖项定义在 `pyproject.toml` 中，核心包括：
 
-```yaml
-# DeepSeek API
-deepseek_api_key: "sk-..."
-deepseek_api_url: "https://api.deepseek.com/chat/completions"
+- `nonebot2[fastapi]` + `nonebot-adapter-onebot`
+- `nonebot-plugin-alconna`（结构化命令解析）
+- `sqlalchemy` + `aiosqlite`（异步 ORM）
+- `cachetools`（影子上下文 TTL 缓存）
+- `pydantic` + `pydantic-settings`（配置与 Schema 校验）
+- `pyyaml` + `watchdog`（配置热重载）
+- `httpx`（HTTP 客户端）
+- `tiktoken`（Token 精确计数）
 
-# Node.js 引擎
-node_deepseek_api_key: "sk-..."
-node_base_url: "https://api.deepseek.com"
-node_model: "deepseek-chat"
-node_temperature: 0.7
+### 配置
 
-# 管理员 QQ
-superusers:
-  - "123456789"
-```
+所有核心配置位于 `config/` 目录：
 
-### 3. 安装依赖
+| 文件 | 用途 |
+|------|------|
+| `config_bot_base.yaml` | 主配置文件（API Key、超管 QQ、Feature Flag、路径等） |
+| `character.json` | 角色卡人设（名字、性格、开场白） |
+| `worldbook.json` | 世界书条目（可选，配合语义检索使用） |
+| `option.yml` | JM 下载配置 |
+
+**可视化配置面板**：启动后访问 `http://127.0.0.1:8081` 打开 Web 管理面板，所有配置项支持在线修改，热更新即时生效。
+
+### 启动
 
 ```bash
-# Python 依赖
-pip install nonebot2 nonebot-adapter-onebot sqlalchemy aiosqlite httpx pydantic pydantic-settings pyyaml watchdog faiss-cpu numpy
-
-# Node.js 依赖（自动安装，也可手动）
-cd engine && npm install
+python bot.py
 ```
-
-### 4. 启动
-
-```bash
-# 方式一：通过 NoneBot2 启动（推荐，自动管理 Node.js 子进程）
-nb run
-
-# 方式二：分别启动
-# 终端 1：启动 Node.js 引擎
-cd engine
-DEEPSEEK_API_KEY=sk-xxx DEEPSEEK_BASE_URL=https://api.deepseek.com \
-DEEPSEEK_MODEL=deepseek-chat LLM_TEMPERATURE=0.7 NODE_PORT=3010 \
-node server.js
-
-# 终端 2：启动 Python 主进程
-python -m nonebot run
-```
-
-### 5. 运行契约测试
-
-```bash
-# 确保 Node.js 服务已启动
-pytest tests/test_contract_drift.py -v
-```
-
----
-
-## 管理面板
-
-启动后访问 `http://127.0.0.1:8081` 打开 Web 配置面板。
-
-- 首次访问需通过浏览器打开（Token 自动注入 HTML）
-- API 接口需携带 `Authorization: Bearer <token>` 头
-- 每次 Python 重启后 Token 自动轮换
-
----
-
-## Feature Flags
-
-在 `config_bot_base.yaml` 中配置，支持灰度开启：
-
-| Flag | 默认值 | 说明 |
-|------|--------|------|
-| `enable_strict_schema` | `True` | 跨端 Pydantic Schema 校验 |
-| `enable_task_queue` | `False` | 高可用任务队列（持久化+重试） |
-| `enable_dynamic_loop` | `False` | 智能循环终止（Jaccard+完成信号） |
-| `entity_relation_enabled` | `False` | 知识图谱实体/关系提取 |
-| `semantic_lorebook_enabled` | `False` | 语义向量检索（FAISS） |
-| `token_arbitration_enabled` | `False` | Token 预算优先级裁剪 |
 
 ---
 
@@ -154,57 +143,100 @@ pytest tests/test_contract_drift.py -v
 
 ```
 src/plugins/chatbot/
-├── __init__.py              # 生命周期管理（启动/关闭 Node.js + 消费者）
-├── config.py                # 配置模型 + 热更新 + Web 管理面板
-├── schemas.py               # Pydantic 数据契约（SSOT）
-├── engine/                  # Node.js 提示词编译引擎
-│   ├── server.js            # Express 服务入口
-│   ├── schemas.js           # Zod 数据契约（镜像）
-│   ├── TavernCoreV2.js      # Prompt 构造器 + Token 仲裁
-│   ├── lorebook-engine.js   # 世界书扫描引擎
-│   ├── prompt-template.js   # 安全 XML 模板
-│   ├── tavern-engine.js     # 宏替换 + Token 计数
-│   └── DeepSeekTavernClient.js  # LLM 调用客户端
-├── repositories/            # 数据访问层
-│   ├── models.py            # SQLAlchemy ORM 模型
-│   ├── memory_repo.py       # 记忆仓库（六张表 CRUD）
-│   ├── image_repo.py        # 图片元数据仓库
-│   └── book_repo.py         # 书籍文件仓库
-├── services/                # 业务逻辑层
-│   ├── agent_service.py     # ReAct 智能体循环
-│   ├── memory_service.py    # 后台记忆压缩队列
-│   ├── permission_service.py # 权限与审计
-│   ├── image_service.py     # 图片检索与抗风控
-│   ├── drawing_service.py   # AI 绘图
-│   └── book_service.py      # 书籍管理与 JM 下载
-├── tools/                   # LLM 可调用工具
-│   ├── base_tool.py         # 工具抽象基类
-│   ├── registry.py          # 工具注册表 + 权限过滤
-│   ├── image_tool.py        # 绘图/搜图工具
-│   ├── admin_tool.py        # 禁言管理工具
-│   ├── book_tool.py         # 推荐书/JM 下载工具
-│   └── system_tool.py       # 系统级工具（mark_task_complete）
-├── utils/                   # 工具库
-│   ├── embedding.py         # FAISS 语义检索
-│   ├── string_utils.py      # 字符串处理
-│   ├── file_utils.py        # 异步文件操作
-│   └── pdf_utils.py         # PDF 转换与加密
-├── matchers/                # NoneBot2 事件响应器
-│   ├── chat_entry.py        # 聊天入口（@触发 + 随机插嘴）
-│   ├── admin_hard.py        # 管理指令（活跃度/潜水/授权）
-│   └── event_notice.py      # 戳一戳/进出群事件
-├── tests/                   # 契约测试
-│   ├── conftest.py          # pytest 路径配置
-│   └── test_contract_drift.py  # 跨端 Schema 漂移检测
-├── web/
-│   └── index.html           # 管理面板前端
-└── docs/                    # 项目文档
-    ├── ARCHITECTURE.md
-    └── CROSS_END_CONTRACT.md
+├── __init__.py                 # 插件入口：生命周期钩子、服务自愈
+├── config.py                   # ConfigManager（原子写入 + 热重载 + Web API）
+├── schemas.py                  # Pydantic 跨端 Schema（CommandResult 等）
+├── guardian.py                 # 事件循环监控器
+│
+├── matchers/                   # NoneBot 事件匹配器
+│   ├── admin_hard.py           # 控制面：Alconna 管理指令（block=True）
+│   ├── chat_entry.py           # 数据面：消息入口 + 触发判定
+│   └── event_notice.py         # 事件通知（戳一戳、欢迎/退群）
+│
+├── tools/                      # 工具系统（微内核核心）
+│   ├── base_tool.py            # BaseTool 抽象基类
+│   ├── registry.py             # ToolRegistry / AgentToolRegistry / SystemToolRegistry
+│   ├── agent_tools/            # 数据面工具（LLM 可见）
+│   │   ├── image_tool.py       # GenerateImageTool, SearchAcgImageTool
+│   │   ├── book_tool.py        # RecommendBookTool, JmDownloadTool
+│   │   ├── rule_tool.py        # LearnRuleTool, ForgetRuleTool
+│   │   └── system_tool.py      # MarkTaskCompleteTool
+│   └── system_tools/           # 控制面工具（LLM 绝对不可见）
+│       └── admin_tool.py       # BanUserTool
+│
+├── services/                   # 业务服务层
+│   ├── agent_service.py        # AgentService：双脑循环编排
+│   ├── prompt_adapter.py       # PromptAdapter：逻辑脑/演员脑 Prompt 编译
+│   ├── shadow_context.py       # 影子上下文（TTLCache 单例）
+│   ├── permission_service.py   # 权限服务（鉴权 + 管理操作 + AI 审计）
+│   ├── memory_service.py       # 记忆压缩服务
+│   ├── rule_engine.py          # 动态规则引擎
+│   ├── rule_injector.py        # 规则指令注入器
+│   ├── drawing_service.py      # AI 画图服务
+│   ├── image_service.py        # 搜图服务
+│   └── book_service.py         # 书籍/下载服务
+│
+├── repositories/               # 数据持久层
+│   ├── models.py               # SQLAlchemy 2.0 表定义（9 张表）
+│   ├── memory_repo.py          # MemoryRepository（单例，异步 CRUD）
+│   ├── rule_repo.py            # RuleRepository（规则 + 变更日志）
+│   ├── book_repo.py            # BookRepository（文件扫描）
+│   └── image_repo.py           # ImageRepository（Pandas 查询）
+│
+├── engine/                     # Prompt 编译引擎
+│   ├── token_budget.py         # Token 预算仲裁（Priority 裁剪）
+│   ├── prompt_builder.py       # PromptPipeline 构建器
+│   ├── card_parser.py          # 角色卡解析器
+│   ├── lorebook_engine.py      # 世界书扫描引擎
+│   └── macro_engine.py         # 宏替换引擎
+│
+├── utils/                      # 工具函数
+│   ├── session_dumper.py       # 调试快照（JSONL 格式）
+│   ├── alert_manager.py        # 告警管理器
+│   ├── embedding.py            # 向量嵌入工具
+│   └── keyword_utils.py        # 关键词规范化
+│
+├── web/                        # Web 管理面板
+│   └── index.html              # 前端页面
+│
+└── docs/                       # 架构文档
+    └── ARCHITECTURE.md         # 架构蓝图说明书
 ```
+
+---
+
+## 安全与物理隔离
+
+### 为什么 LLM 无法越权调用 SystemTools
+
+1. **物理目录隔离**：`BanUserTool` 定义在 `tools/system_tools/admin_tool.py`，而 `AgentToolRegistry` 仅注册 `tools/agent_tools/` 下的工具。两个注册表是独立的实例。
+
+2. **Schema 过滤**：`AgentToolRegistry.get_all_schemas()` 仅返回数据面工具的 OpenAI function-calling Schema。`BanUserTool` 的 Schema **永远不会**出现在发送给 LLM 的 `tools` 参数中。
+
+3. **执行时权限二次验证**：即使通过某种方式绕过了 Schema 过滤，`ToolRegistry.execute_tool()` 在执行前会进行权限二次验证。`admin` 级工具要求 `context["is_admin"]` 为真。
+
+4. **控制面指令走独立路径**：禁言等管理操作通过 `admin_hard.py` 中的 Alconna 指令直接调用 `BanUserTool.execute()`，完全绕过 `AgentService` 和 LLM 推理链路。
+
+### 配置原子化写入
+
+`ConfigManager.save_config()` 采用 **Write-First-Then-Update-Memory** 策略：
+
+1. 将候选配置序列化为 YAML 字典
+2. 通过 `tempfile.mkstemp()` 创建临时文件
+3. 写入临时文件后，调用 `os.replace()` 原子性替换目标文件
+4. 仅在落盘成功后，才更新内存中的 `_config` 对象
+5. 每次写入递增 `_version` 计数器
+
+此机制确保：写入中途进程崩溃不会损坏原始配置文件；内存中的配置始终与磁盘一致。
+
+---
+
+## 进阶文档
+
+详细的架构设计、数据模型、API 参考等，请前往 [`docs/`](src/plugins/chatbot/docs/) 目录。
 
 ---
 
 ## 许可证
 
-Private — 仅供内部使用。
+私有项目，仅供内部使用。

@@ -18,7 +18,27 @@
       "Bash(python -m pytest tests/test_rule_repo.py -v)",
       "Bash(pip list *)",
       "Bash(python -c \"import sys; from unittest.mock import MagicMock; [sys.modules.__setitem__\\(m, MagicMock\\(\\)\\) for m in ['nonebot','nonebot.log','nonebot.adapters','nonebot.adapters.onebot','nonebot.adapters.onebot.v11','img2pdf','PyPDF2','PIL','PIL.Image','aiofiles','httpx','faiss']]; from repositories.memory_repo import MemoryRepository; print\\('OK'\\)\")",
-      "Bash(python -c \"import nonebot; print\\(dir\\(nonebot\\)\\)\")"
+      "Bash(python -c \"import nonebot; print\\(dir\\(nonebot\\)\\)\")",
+      "Read(//c/Users/Bot/Bot/qqbot/qq_bot/qq_bot/临时/**)",
+      "Bash(python -m pytest src/plugins/chatbot/tests/test_dual_brain.py -v --tb=short)",
+      "Bash(git *)",
+      "Bash(\"C:/Users/Bot/Bot/qqbot/qq_bot/qq_bot/.venv/Scripts/pip.exe\" list *)",
+      "Bash(conda list *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:pypi.org)",
+      "Bash(pip index *)",
+      "WebFetch(domain:nonebot.dev)",
+      "WebFetch(domain:arclet.top)",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/services/shadow_context.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/tools/system_tools/admin_tool.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/services/prompt_adapter.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/tools/base_tool.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/tools/agent_tools/image_tool.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/tools/agent_tools/book_tool.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/tools/agent_tools/rule_tool.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/services/agent_service.py\")",
+      "Bash(python -m py_compile \"临时/src/plugins/chatbot/matchers/admin_hard.py\")"
     ]
   }
 }

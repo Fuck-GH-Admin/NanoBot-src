@@ -1,11 +1,12 @@
-# src/plugins/chatbot/tools/admin_tool.py
+# src/plugins/chatbot/tools/system_tools/admin_tool.py
 
 from typing import Any, Dict, List, Tuple
-from .base_tool import BaseTool
+from ..base_tool import BaseTool
 
 
 class BanUserTool(BaseTool):
     name = "ban_user"
+    is_write_operation = True
     description = '【条件触发】：当管理员命令你"禁言XXX"、"让他闭嘴"时，必须输出 tool_call 调用此工具来执行真实的群管操作，绝对禁止仅用文字恐吓。'
     parameters = {
         "type": "object",
@@ -44,7 +45,7 @@ class BanUserTool(BaseTool):
 
         permission_srv = context.get("permission_service")
         if not permission_srv:
-            from ..services.permission_service import PermissionService
+            from ...services.permission_service import PermissionService
             permission_srv = PermissionService()
 
         result_msg = await permission_srv.ban_user(
@@ -55,4 +56,23 @@ class BanUserTool(BaseTool):
             operator_id=context["user_id"],
             reason=reason
         )
+
+        from ...services.shadow_context import ShadowContext
+        ShadowContext().push(
+            f"group_{group_id}",
+            f"管理员 {context['user_id']} 禁言了用户 {target_id}，时长 {duration} 秒"
+        )
+
+        import time
+        from ...repositories.memory_repo import MemoryRepo
+        await MemoryRepo().insert_tool_log(
+            session_id=f"group_{group_id}",
+            request_id=f"ban_{target_id}_{int(time.time())}",
+            step=1,
+            trigger="control_plane",
+            tool_name="ban_user",
+            arguments={"target_id": target_id, "duration": duration, "reason": reason},
+            result_summary=result_msg[:300] if result_msg else "",
+        )
+
         return result_msg, []
