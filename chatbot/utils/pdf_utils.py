@@ -126,7 +126,7 @@ class PDFUtils:
             input_pdf = Path(input_pdf)
             output_pdf = Path(output_pdf)
             
-            if not input_pdf.exists():
+            if len(str(input_pdf)) > 255 or not input_pdf.exists():
                 return False
 
             reader = PdfReader(str(input_pdf))

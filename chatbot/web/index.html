@@ -258,6 +258,118 @@
             border: 0.5px solid var(--border);
             margin: 1.5rem 0;
         }
+        /* Worldbook entry cards */
+        .wb-section-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin: 1.5rem 0 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .wb-entry-card, .draft-card {
+            background: var(--surface);
+            border-radius: var(--radius);
+            padding: 1.25rem;
+            margin-bottom: 1rem;
+            box-shadow: var(--shadow);
+        }
+        .wb-entry-card { border-left: 4px solid var(--accent); }
+        .draft-card { border-left: 4px solid #f59e0b; }
+        .wb-entry-card .form-grid, .draft-card .form-grid {
+            grid-template-columns: 1fr 1fr;
+        }
+        .wb-entry-card textarea, .draft-card textarea {
+            min-height: 60px;
+            resize: vertical;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .draft-content {
+            background: #f9fafb;
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin: 0.5rem 0;
+            font-size: 0.9rem;
+            color: var(--text);
+            white-space: pre-wrap;
+        }
+        .draft-keys {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+            margin-bottom: 0.5rem;
+        }
+        .draft-key-tag {
+            background: #dbeafe;
+            color: #1e40af;
+            padding: 0.2rem 0.6rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .draft-actions {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 0.75rem;
+        }
+        .wb-actions-bar {
+            display: flex;
+            gap: 0.75rem;
+            margin: 1.5rem 0;
+            flex-wrap: wrap;
+        }
+        .wb-empty {
+            color: var(--text-secondary);
+            padding: 1.5rem;
+            text-align: center;
+            font-style: italic;
+        }
+        /* Login overlay */
+        #login-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.6);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 1000;
+        }
+        #login-overlay.hidden { display: none; }
+        .login-card {
+            background: var(--surface);
+            border-radius: var(--radius);
+            padding: 2rem;
+            width: 360px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+        }
+        .login-card h2 { margin: 0 0 1.5rem; text-align: center; }
+        .login-card input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 1rem;
+            margin-bottom: 1rem;
+            box-sizing: border-box;
+        }
+        .login-card button {
+            width: 100%;
+            padding: 0.75rem;
+            border: none;
+            border-radius: 8px;
+            background: var(--accent);
+            color: white;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+        }
+        .login-card button:hover { background: var(--accent-hover); }
+        .login-card button:disabled { opacity: 0.6; cursor: not-allowed; }
+        #login-error {
+            color: var(--danger);
+            font-size: 0.85rem;
+            margin-bottom: 0.75rem;
+            min-height: 1.2em;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -268,6 +380,7 @@
     <div class="tabs">
         <button class="tab-btn active" data-tab="global">🌐 全局设置</button>
         <button class="tab-btn" data-tab="groups">👥 群组管理</button>
+        <button class="tab-btn" data-tab="worldbook">📚 世界书与草稿</button>
     </div>
 
     <!-- 全局设置面板 -->
@@ -347,6 +460,28 @@
         </div>
 
         <div class="card">
+            <h2>对话路由参数</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>沉浸会话窗口期 (秒)</label>
+                    <input type="number" id="session_timeout" min="60" max="3600">
+                </div>
+                <div class="form-group">
+                    <label>话题相似度阈值</label>
+                    <input type="number" id="similarity_threshold" step="0.01" min="0" max="1">
+                </div>
+                <div class="form-group">
+                    <label>EMA 老中心权重</label>
+                    <input type="number" id="ema_old_weight" step="0.05" min="0" max="1">
+                </div>
+                <div class="form-group">
+                    <label>EMA 新消息权重</label>
+                    <input type="number" id="ema_new_weight" step="0.05" min="0" max="1">
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
             <h2>文件路径</h2>
             <div class="form-grid">
                 <div class="form-group"><label>图片目录</label><input type="text" id="image_folder"></div>
@@ -402,6 +537,25 @@
         <div id="no-groups-msg" style="color:var(--text-secondary); padding:1rem;">暂无群组配置，点击上方按钮添加。</div>
     </div>
 
+    <!-- 世界书与草稿面板 -->
+    <div id="tab-worldbook" class="tab-panel">
+        <div class="card">
+            <h2>正式词条</h2>
+            <div id="wb-entries-container"></div>
+            <div class="wb-actions-bar">
+                <button class="btn btn-primary btn-add" id="wb-add-btn">➕ 新增词条</button>
+                <button class="btn btn-success" id="wb-save-btn">💾 保存全部</button>
+                <span class="status-msg" id="wb-status-msg"></span>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>待审核草稿</h2>
+            <div id="wb-drafts-container"></div>
+            <div id="no-drafts-msg" class="wb-empty">暂无待审核草稿。话题归档时自动提炼的设定将出现在此处。</div>
+        </div>
+    </div>
+
     <!-- 保存栏 -->
     <div class="save-section">
         <button class="btn btn-success" id="save-btn">💾 保存配置</button>
@@ -409,20 +563,81 @@
     </div>
 </div>
 
+<!-- 登录遮罩 -->
+<div id="login-overlay" class="hidden">
+    <div class="login-card">
+        <h2>🔐 管理面板登录</h2>
+        <div id="login-error"></div>
+        <form id="login-form">
+            <input type="password" id="login-password" placeholder="请输入管理密码" autocomplete="current-password">
+            <button type="submit" id="login-btn">登 录</button>
+        </form>
+    </div>
+</div>
+
 <script>
 (function() {
-    // ---------- 阅后即焚：提取并销毁 Token ----------
-    const metaEl = document.querySelector('meta[name="admin-token"]');
-    const ADMIN_TOKEN = metaEl ? metaEl.content : '';
-    if (metaEl) metaEl.remove();
-
     // ---------- 工具函数 ----------
     const $ = (sel) => document.querySelector(sel);
     const $$ = (sel) => document.querySelectorAll(sel);
 
-    function apiFetch(url, options = {}) {
-        const headers = { ...(options.headers || {}), 'Authorization': `Bearer ${ADMIN_TOKEN}` };
-        return fetch(url, { ...options, headers });
+    // ---------- 登录状态管理 ----------
+    let _pendingLoginResolve = null;
+
+    function showLoginForm() {
+        $('#login-overlay').classList.remove('hidden');
+        $('#login-password').value = '';
+        $('#login-error').textContent = '';
+        $('#login-password').focus();
+        return new Promise(resolve => { _pendingLoginResolve = resolve; });
+    }
+
+    function hideLoginForm() {
+        $('#login-overlay').classList.add('hidden');
+    }
+
+    $('#login-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = $('#login-btn');
+        btn.disabled = true;
+        btn.textContent = '验证中...';
+        $('#login-error').textContent = '';
+        try {
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ password: $('#login-password').value })
+            });
+            if (!res.ok) {
+                const data = await res.json();
+                throw new Error(data.error || '登录失败');
+            }
+            hideLoginForm();
+            if (_pendingLoginResolve) {
+                _pendingLoginResolve(true);
+                _pendingLoginResolve = null;
+            }
+        } catch (err) {
+            $('#login-error').textContent = err.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '登 录';
+        }
+    });
+
+    async function apiFetch(url, options = {}) {
+        const fetchOpts = {
+            ...options,
+            credentials: 'same-origin',
+            headers: { ...(options.headers || {}) }
+        };
+        let res = await fetch(url, fetchOpts);
+        if (res.status === 401) {
+            const logged = await showLoginForm();
+            if (logged) res = await fetch(url, fetchOpts);
+        }
+        return res;
     }
 
     // 状态
@@ -466,6 +681,10 @@
         // 数字字段
         $('#agent_max_loops').value = cfg.agent_max_loops || 5;
         $('#agent_request_timeout').value = cfg.agent_request_timeout || 60;
+        $('#session_timeout').value = cfg.session_timeout || 600;
+        $('#similarity_threshold').value = cfg.similarity_threshold ?? 0.35;
+        $('#ema_old_weight').value = cfg.ema_old_weight ?? 0.7;
+        $('#ema_new_weight').value = cfg.ema_new_weight ?? 0.3;
 
         // 开关字段
         $('#enable_reranker').checked = !!cfg.enable_reranker;
@@ -515,6 +734,11 @@
 
         const timeout = parseFloat($('#agent_request_timeout').value);
         data.agent_request_timeout = isNaN(timeout) ? 60 : timeout;
+
+        data.session_timeout = parseInt($('#session_timeout').value) || 600;
+        data.similarity_threshold = parseFloat($('#similarity_threshold').value) || 0.35;
+        data.ema_old_weight = parseFloat($('#ema_old_weight').value) || 0.7;
+        data.ema_new_weight = parseFloat($('#ema_new_weight').value) || 0.3;
 
         // Set 字段 -> 逗号分隔字符串或数组？后端可以处理逗号分隔字符串，但我们发送数组更可靠
         const setFields = ['superusers', 'private_whitelist', 'ai_admin_qq', 'drawing_whitelist', 'welcome_groups'];
@@ -692,6 +916,198 @@
         }, 5000);
     }
 
+    // ---------- 世界书管理 ----------
+    let wbEntries = [];
+    let wbDrafts = [];
+
+    async function loadWorldbook() {
+        try {
+            const res = await apiFetch('/api/worldbook');
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const data = await res.json();
+            wbEntries = data.entries || [];
+            wbDrafts = data.drafts || [];
+            renderWbEntries();
+            renderWbDrafts();
+        } catch (e) {
+            showWbStatus('加载世界书失败: ' + e.message, true);
+        }
+    }
+
+    function renderWbEntries() {
+        const container = $('#wb-entries-container');
+        if (wbEntries.length === 0) {
+            container.innerHTML = '<div class="wb-empty">暂无正式词条。点击下方"新增词条"开始添加。</div>';
+            return;
+        }
+        container.innerHTML = wbEntries.map((entry, idx) => `
+            <div class="wb-entry-card" data-idx="${idx}">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>关键词 (逗号分隔)</label>
+                        <input type="text" class="wb-key" value="${escapeHtml((entry.key || []).join(', '))}">
+                    </div>
+                    <div class="form-group">
+                        <label>作用域 (留空=全局)</label>
+                        <input type="text" class="wb-scope" value="${escapeHtml(entry.custom_scope || '')}" placeholder="global">
+                    </div>
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>内容</label>
+                        <textarea class="wb-content">${escapeHtml(entry.content || '')}</textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>常驻注入 (constant)</label>
+                        <label class="toggle-label">
+                            <input type="checkbox" class="toggle-checkbox wb-constant" ${entry.constant ? 'checked' : ''}>
+                            <div class="toggle"></div>
+                        </label>
+                    </div>
+                    <div class="form-group" style="align-self:end;">
+                        <button class="btn btn-danger wb-del-btn">🗑️ 删除</button>
+                    </div>
+                </div>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('.wb-del-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const card = btn.closest('.wb-entry-card');
+                const idx = parseInt(card.dataset.idx);
+                wbEntries.splice(idx, 1);
+                renderWbEntries();
+            });
+        });
+    }
+
+    function renderWbDrafts() {
+        const container = $('#wb-drafts-container');
+        const noMsg = $('#no-drafts-msg');
+        if (wbDrafts.length === 0) {
+            container.innerHTML = '';
+            noMsg.style.display = 'block';
+            return;
+        }
+        noMsg.style.display = 'none';
+        container.innerHTML = wbDrafts.map(draft => `
+            <div class="draft-card" data-uid="${draft.uid}">
+                <div class="card-header">
+                    <h3>草稿 #${draft.uid} <span style="font-weight:400;font-size:0.85rem;color:var(--text-secondary);">(${escapeHtml(draft.custom_scope || 'global')})</span></h3>
+                </div>
+                <div class="draft-keys">
+                    ${(draft.key || []).map(k => `<span class="draft-key-tag">${escapeHtml(k)}</span>`).join('')}
+                </div>
+                <div class="draft-content">${escapeHtml(draft.content || '')}</div>
+                <div class="draft-actions">
+                    <button class="btn btn-success draft-approve-btn">✅ 批准入库</button>
+                    <button class="btn btn-danger draft-reject-btn">🗑️ 丢弃</button>
+                </div>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('.draft-approve-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const card = btn.closest('.draft-card');
+                const uid = parseInt(card.dataset.uid);
+                btn.disabled = true;
+                btn.textContent = '处理中...';
+                try {
+                    const res = await apiFetch('/api/worldbook/draft/approve', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid })
+                    });
+                    const result = await res.json();
+                    if (!res.ok) throw new Error(result.error || 'HTTP ' + res.status);
+                    showWbStatus(result.message || '已批准', false);
+                    await loadWorldbook();
+                } catch (e) {
+                    showWbStatus('批准失败: ' + e.message, true);
+                    btn.disabled = false;
+                    btn.textContent = '✅ 批准入库';
+                }
+            });
+        });
+
+        container.querySelectorAll('.draft-reject-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const card = btn.closest('.draft-card');
+                const uid = parseInt(card.dataset.uid);
+                if (!confirm(`确定丢弃草稿 #${uid}？此操作不可撤销。`)) return;
+                btn.disabled = true;
+                btn.textContent = '处理中...';
+                try {
+                    const res = await apiFetch('/api/worldbook/draft/reject', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid })
+                    });
+                    const result = await res.json();
+                    if (!res.ok) throw new Error(result.error || 'HTTP ' + res.status);
+                    showWbStatus(result.message || '已丢弃', false);
+                    await loadWorldbook();
+                } catch (e) {
+                    showWbStatus('丢弃失败: ' + e.message, true);
+                    btn.disabled = false;
+                    btn.textContent = '🗑️ 丢弃';
+                }
+            });
+        });
+    }
+
+    function collectWbEntries() {
+        const cards = document.querySelectorAll('#wb-entries-container .wb-entry-card');
+        const entries = [];
+        cards.forEach(card => {
+            const keysRaw = card.querySelector('.wb-key').value.trim();
+            const content = card.querySelector('.wb-content').value.trim();
+            const constant = card.querySelector('.wb-constant').checked;
+            const scope = card.querySelector('.wb-scope').value.trim();
+            if (!content) return;
+            const entry = {
+                key: keysRaw ? keysRaw.split(',').map(s => s.trim()).filter(Boolean) : [],
+                content,
+                constant
+            };
+            if (scope) entry.custom_scope = scope;
+            entries.push(entry);
+        });
+        return entries;
+    }
+
+    $('#wb-add-btn').addEventListener('click', () => {
+        wbEntries.push({ key: [], content: '', constant: false });
+        renderWbEntries();
+        const container = $('#wb-entries-container');
+        container.lastElementChild.scrollIntoView({ behavior: 'smooth' });
+    });
+
+    $('#wb-save-btn').addEventListener('click', async () => {
+        const entries = collectWbEntries();
+        try {
+            const res = await apiFetch('/api/worldbook/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ entries })
+            });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.error || 'HTTP ' + res.status);
+            showWbStatus(result.message || '已保存', false);
+            wbEntries = entries;
+        } catch (e) {
+            showWbStatus('保存失败: ' + e.message, true);
+        }
+    });
+
+    function showWbStatus(msg, isError) {
+        const el = $('#wb-status-msg');
+        el.textContent = msg;
+        el.className = 'status-msg ' + (isError ? 'error' : 'success');
+        setTimeout(() => {
+            el.textContent = '';
+            el.className = 'status-msg';
+        }, 5000);
+    }
+
     // ---------- Tab 切换 ----------
     const tabBtns = $$('.tab-btn');
     const panels = $$('.tab-panel');
@@ -702,11 +1118,25 @@
             btn.classList.add('active');
             panels.forEach(p => p.classList.remove('active'));
             document.getElementById('tab-' + target).classList.add('active');
+            if (target === 'worldbook') loadWorldbook();
         });
     });
 
-    // 启动
-    loadConfig();
+    // 启动：先检查登录状态
+    async function checkAuth() {
+        try {
+            const res = await fetch('/api/config', { credentials: 'same-origin' });
+            if (res.status === 401 || res.status === 403) {
+                await showLoginForm();
+            }
+        } catch (e) {
+            // 网络错误（服务器未就绪），显示登录表单
+            await showLoginForm();
+        }
+        loadConfig();
+        loadWorldbook();
+    }
+    checkAuth();
 })();
 </script>
 </body>

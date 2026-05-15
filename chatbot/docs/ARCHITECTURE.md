@@ -1,358 +1,762 @@
-# 架构蓝图说明书
+# Chatbot B — Architecture Reference (V4)
 
-> Chatbot B V3 系统内部架构的权威技术文档。
-> 基于微内核（Microkernel）设计哲学，控制面与数据面物理隔离。
+> 权威技术文档。基于微内核（Microkernel）设计哲学，控制面与数据面物理隔离。
+> 最后更新：2026-05-12
 
 ---
 
-## 1. 系统拓扑
+## 目录
 
-### 1.1 进程模型
+1. [核心架构拓扑](#1-核心架构拓扑)
+2. [记忆与知识图谱系统](#2-记忆与知识图谱系统)
+3. [世界书与动态设定系统](#3-世界书与动态设定系统)
+4. [动态上下文与 Token 仲裁](#4-动态上下文与-token-仲裁)
+5. [日志路由系统](#5-日志路由系统)
+6. [Web 控制台与配置热重载](#6-web-控制台与配置热重载)
 
-系统为单进程架构，运行于 NoneBot2 框架之上：
+---
 
-| 组件 | 端口 | 职责 |
-|------|------|------|
-| **NoneBot2 主进程** | — | 事件监听、业务逻辑、LLM 调用、数据持久化 |
-| **Web 管理面板** | 8081 | 配置读写（零信任 Bearer Token 鉴权） |
+## 1. 核心架构拓扑
 
-### 1.2 消息处理链路
+### 1.1 单进程异步架构
+
+系统运行于 NoneBot2 框架之上，采用**单进程异步**模型。所有 I/O 密集操作（HTTP 调用、数据库查询、文件写入）均通过 `asyncio` 协程调度；CPU 密集操作通过 `asyncio.to_thread()` 卸载至线程池，保护主事件循环。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NoneBot2 主进程 (asyncio)                     │
+│                                                                 │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐ │
+│  │ Matchers │──→│ Services │──→│  Repos   │──→│   SQLite     │ │
+│  │ (事件层) │   │ (业务层) │   │ (数据层) │   │  (持久化)    │ │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────────┘ │
+│       │              │                                         │
+│       │              ├─→ LLM API (DeepSeek / SiliconFlow)      │
+│       │              ├─→ Embedding API (向量检索)               │
+│       │              └─→ Pixiv / JM 外部服务                   │
+│       │                                                        │
+│  ┌──────────┐   ┌──────────────┐                               │
+│  │ Web 面板 │   │ Background   │                               │
+│  │ :8081    │   │ Daemons      │                               │
+│  │(守护线程)│   │ (协程)       │                               │
+│  └──────────┘   └──────────────┘                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**消息处理链路**：
 
 ```
 用户消息进入 NoneBot2
         │
-        ├─ priority=3 → admin_hard.py (Alconna 结构化匹配)
-        │               block=True，指令文本不会泄漏到下游
+        ├─ priority=3  → admin_hard.py  (Alconna 结构化匹配, block=True)
+        │                管理指令在此终结，绝不泄漏至下游
         │
-        └─ priority=10 → chat_entry.py (消息入口)
-                         触发判定 → AgentService.run_agent()
+        ├─ priority=5  → event_notice.py (戳一戳/入群退群通知)
+        │
+        └─ priority=10 → chat_entry.py  (主消息入口)
+                         │
+                         ├─ 噪音过滤 (_NOISE_PATTERN + 最小长度)
+                         ├─ 沉浸会话判定 (ACTIVE_SESSIONS 超时机制)
+                         ├─ 话题路由 (TopicRouter L1/L1.5/L2/L3)
+                         └─ AgentService.run_agent()
 ```
 
-`block=True` 是安全隔离的关键：一旦 Alconna 匹配成功，事件传播即被终止，`chat_entry.py` 永远不会看到管理指令的原始文本。
+### 1.2 双脑协作模型 (Dual-Brain)
 
----
+核心设计：每次用户交互触发**两次独立的 LLM 调用**，分别由"逻辑脑"和"演员脑"承担，职责严格隔离。
 
-## 2. 微内核架构：控制面与数据面
+```
+用户消息
+   │
+   ▼
+┌──────────────────────────────────────────────────────────────┐
+│                 Phase 1: 逻辑脑 (Scheduler)                  │
+│                                                              │
+│  身份：底层逻辑调度模块（严禁输出自然语言）                    │
+│  工具：AgentToolRegistry 中的所有数据面工具                   │
+│  循环：最多 agent_max_loops 轮（默认 10）                    │
+│  去重：(tool_name, normalized_args) 签名集合，同签名仅执行1次 │
+│  防污染：Actor 历史回复以 <actor_past_reply> XML 封装        │
+│  强制收口：末尾 System 消息反复提醒 "content 必须为空"        │
+│                                                              │
+│  输出：有且仅有一个 tool_call，content 恒为空                 │
+└──────────────────────┬───────────────────────────────────────┘
+                       │ 工具执行结果 → system_notification
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│                 Phase 2: 演员脑 (Actor)                      │
+│                                                              │
+│  身份：完整角色人格（角色卡 + 世界书 + 宏替换）              │
+│  工具：无（纯文本生成）                                      │
+│  注入：                                                     │
+│    · 角色卡 (CharacterCard V1/V2/V3)                        │
+│    · 世界书词条 (WorldBook matched entries)                  │
+│    · ~~群组摘要 + 群友画像 + 社交关系网~~（已废弃，不再注入）│
+│    · 影子上下文 (ShadowContext TTLCache)                     │
+│    · 动态规则指令 (如有匹配)                                │
+│    · system_notification（工具执行结果转述）                 │
+│    · 会话生命周期感知指令                                    │
+│                                                              │
+│  输出：自然语言回复 + 可选 session_ctl 控制块                │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+                  最终回复 → 持久化（Topic Harvester 后台归档时提炼）
+```
 
-### 2.1 设计哲学
+**逻辑脑 Prompt 核心指令**（`prompt_adapter.py:compile_logic_prompt`）：
 
-传统架构中，所有工具（包括管理工具）共享同一个注册表，LLM 可以通过 function-calling 看到并调用任何工具。V3 架构将工具系统在物理层面切割为两个独立的注册表：
+```
+=== CRITICAL: PURE LOGIC SCHEDULER MODE ===
+你是 {char_name} 的底层逻辑调度模块。你的唯一使命是：分析用户意图并调用适当的工具。
+
+【STRICTLY PROHIBITED ACTIONS】
+- 禁止输出任何自然语言、对话、解释或角色扮演。
+- 禁止在工具调用前添加任何思考过程。
+- 严禁主动结束用户的会话状态。
+
+【YOUR ONLY ALLOWED BEHAVIOR】
+1. 如果用户指令明确需要后台操作，调用对应功能工具。
+2. 如果用户输入为日常问候/聊天/无意义字符，必须调用 `no_op` 工具。
+```
+
+**演员脑会话生命周期感知**：演员脑可输出 ````session_ctl`{"close_session": true}`` 控制块，由 `agent_service.py` 解析后终结沉浸会话。
+
+**单脑降级模式**：当 `enable_dual_brain=False` 时，退化为 ReAct 循环（`_run_agent_single_brain`），使用 Jaccard 相似度（阈值 0.9）检测重复输出，配合 `mark_task_complete` 工具动态终止循环。
+
+### 1.3 工具注册表分层
 
 ```
 tools/
-├── base_tool.py              # BaseTool 抽象基类（is_write_operation 标记）
+├── base_tool.py              # BaseTool ABC (is_write_operation 标记)
 ├── registry.py               # ToolRegistry 基类 + 两个子类
-├── agent_tools/              # 数据面：LLM 可见
-│   ├── image_tool.py         # GenerateImageTool, SearchAcgImageTool
-│   ├── book_tool.py          # RecommendBookTool, JmDownloadTool
-│   ├── rule_tool.py          # LearnRuleTool, ForgetRuleTool
-│   └── system_tool.py        # MarkTaskCompleteTool
+│
+├── agent_tools/              # 数据面：LLM 可见，逻辑脑可调用
+│   ├── system_tool.py        # MarkTaskComplete, NoOp, ExitSession
+│   ├── rule_tool.py          # LearnRule, ForgetRule
+│   ├── image_tool.py         # GenerateImage, SearchAcgImage
+│   └── book_tool.py          # RecommendBook, JmDownload
+│
 └── system_tools/             # 控制面：LLM 绝对不可见
-    └── admin_tool.py         # BanUserTool
+    └── admin_tool.py         # BanUser (由 admin_hard.py 直接调用)
 ```
 
-### 2.2 注册表层次结构
+| 注册表 | 实例持有者 | LLM 可见 | 权限过滤 |
+|--------|-----------|:--------:|---------|
+| `AgentToolRegistry` | `AgentService` | 是 | Schema 级 + 执行级二次验证 |
+| `SystemToolRegistry` | `admin_hard.py` | 否 | 仅内部调用 |
 
-```python
-class ToolRegistry:              # 基类：register / get_tool / get_all_schemas / execute_tool
-    ├── AgentToolRegistry        # 数据面注册表：实例化时注册 agent_tools/ 下的 7 个工具
-    └── SystemToolRegistry       # 控制面注册表：实例化时注册 system_tools/ 下的 1 个工具
+**防重放机制**：`AgentToolRegistry` 在每个 `request_id` 内维护 `executed_signatures: set[str]`，同一签名仅执行 1 次（exactly-once 语义）。
+
+### 1.4 话题路由系统 (Topic Router)
+
+四级路由，为每个 session 维护内存话题池（`ACTIVE_TOPICS_POOL`，每 session 最多 10 个活跃话题）：
+
+```
+消息进入
+   │
+   ├─ L1: 物理强连通 (O(1))
+   │       引用了某条消息？→ 直接继承该消息的 topic_id
+   │
+   ├─ L1.5: 低熵收容所
+   │       纯表情/极短文本？→ 搭最近活跃话题的便车，不调 API
+   │
+   ├─ L2: 语义向量匹配 (网络 I/O)
+   │       SiliconFlow Embedding API → cosine_sim × time_decay
+   │       time_decay = exp(-Δt / 600s)
+   │       命中阈值 → EMA 更新话题中心向量
+   │
+   └─ L3: 新建话题
+           生成 UUID，写入内存池，超限按 last_active 淘汰
 ```
 
-`AgentService` 仅持有 `AgentToolRegistry` 实例。`BanUserTool` 注册在 `SystemToolRegistry` 中，由 `admin_hard.py` 直接调用，不经过 `AgentService`。
+**话题生命周期状态机**：
 
-### 2.3 权限模型
-
-工具权限在两个层面进行验证：
-
-**Schema 层面**（`get_all_schemas`）：
-
-| 权限等级 | Schema 可见性 | 说明 |
-|---------|:------------:|------|
-| `user` | ✅ | 所有用户可见 |
-| `drawing_whitelist` | ✅ | 仅白名单用户可见 |
-| `admin` | ✅ | 仅管理员可见 |
-| `system` | ❌ | 永远不注入 Schema（`MarkTaskCompleteTool`） |
-
-**执行层面**（`execute_tool`）：
-
-即使 Schema 被注入，执行前仍进行二次权限验证。`system` 级工具跳过检查（仅内部调用）；`admin` 级工具检查 `context["is_admin"]`。
+```
+  ACTIVE ──(10min 无活动)──→ SUSPENDED ──(30min 无活动)──→ ARCHIVED
+    │                          │                              │
+    │  (用户发消息时 refresh)   │  (Topic Harvester 扫描)      │
+    └──────────────────────────┘                              │
+                                                              ▼
+                                                    LLM 摘要 + 设定提炼
+                                                    → draft_worldbook.json
+                                                    → 通知管理员审核
+```
 
 ---
 
-## 3. 数据持久层
+## 2. 记忆与知识图谱系统
 
-### 3.1 ER 图
+### 2.1 数据库 ER 结构
+
+系统使用 SQLAlchemy 2.0 异步声明式模型，共 10 张核心表：
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  ChatHistory  │     │  GroupMemory  │     │  UserTrait   │
-├──────────────┤     ├──────────────┤     ├──────────────┤
-│ id (PK)      │     │ session_id   │     │ trait_id(PK) │
-│ session_id   │────→│ summary      │     │ session_id   │
-│ role         │     │ updated_at   │     │ user_id      │
-│ user_id      │     └──────────────┘     │ content      │
-│ name         │                          │ confidence   │
-│ content      │     ┌──────────────┐     │ is_active    │
-│ timestamp    │     │CompactionJnl │     │ updated_at   │
-│ is_summarized│     ├──────────────┤     └──────────────┘
-│ tool_calls   │     │ journal_id   │
-└──────────────┘     │ session_id   │     ┌──────────────┐
-                     │ status       │     │   Entity     │
-                     │ retry_count  │     ├──────────────┤
-                     │ last_error   │     │ entity_id(PK)│
-                     │ created_at   │     │ session_id   │
-                     │ updated_at   │     │ name         │
-                     └──────────────┘     │ type         │
-                                          │ attributes   │
-┌──────────────┐     ┌──────────────┐     │ updated_at   │
-│   Relation   │     │  CustomRule  │     └──────────────┘
-├──────────────┤     ├──────────────┤
-│relation_id   │     │ rule_id (PK) │     ┌──────────────┐
-│ session_id   │     │ scope_type   │     │RuleChangelog │
-│subject_entity│     │ scope_id     │     ├──────────────┤
-│ predicate    │     │ keywords     │     │ id (PK)      │
-│object_entity │     │ tool_name    │     │ action       │
-│ confidence   │     │ hit_count    │     │ rule_id      │
-│evidence_msgs │     │ active       │     │ operator     │
-│ updated_at   │     │ ttl_days     │     │ old/new_value│
-└──────────────┘     └──────────────┘     └──────────────┘
-
-┌──────────────────┐
-│ ToolExecutionLog  │  ← 突变日志：仅记录 is_write_operation=True 的工具
-├──────────────────┤
-│ id (PK)          │
-│ session_id       │
-│ request_id       │
-│ step             │
-│ trigger          │  ← "llm" / "forced_shortcut" / "control_plane"
-│ tool_name        │
-│ arguments        │
-│ result_summary   │
-│ error            │
-│ created_at       │
-└──────────────────┘
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   ChatHistory    │     │   GroupMemory    │     │    UserTrait     │
+├─────────────────┤     ├─────────────────┤     ├─────────────────┤
+│ id (PK, auto)   │     │ session_id (PK) │     │ trait_id (PK)   │
+│ session_id (idx) │────→│ summary         │     │ session_id (idx) │
+│ topic_id (idx)  │     │ updated_at      │     │ user_id (idx)   │
+│ role            │     └─────────────────┘     │ content         │
+│ user_id (idx)   │                             │ confidence      │
+│ name            │     ┌─────────────────┐     │ source_msg_id   │
+│ content         │     │CompactionJournal │     │ is_active       │
+│ timestamp       │     ├─────────────────┤     │ updated_at      │
+│ is_summarized   │     │ journal_id (PK) │     └─────────────────┘
+│ tool_calls(JSON)│     │ session_id (idx)│
+│ message_fprint  │     │ status          │     ┌─────────────────┐
+│ UQ:(sess,fprint)│     │ retry_count     │     │     Entity       │
+└─────────────────┘     │ max_retries     │     ├─────────────────┤
+                        │ last_error      │     │ entity_id (PK)  │
+                        │ created_at      │     │ session_id (idx) │
+                        │ updated_at      │     │ name            │
+                        └─────────────────┘     │ type            │
+                                                │ attributes(JSON)│
+┌─────────────────┐     ┌─────────────────┐     │ updated_at      │
+│    Relation      │     │   CustomRule     │     └─────────────────┘
+├─────────────────┤     ├─────────────────┤
+│ relation_id(PK) │     │ rule_id (PK)    │     ┌─────────────────┐
+│ session_id (idx)│     │ scope_type      │     │  RuleChangelog   │
+│ subject_entity  │     │ scope_id        │     ├─────────────────┤
+│ predicate       │     │ keywords_hash   │     │ id (PK, auto)   │
+│ object_entity   │     │ keywords (JSON) │     │ timestamp       │
+│ confidence      │     │ tool_name       │     │ action          │
+│ evidence(JSON)  │     │ args_extractor  │     │ rule_id         │
+│ updated_at      │     │ pattern_id      │     │ operator        │
+│ UQ:(s,subj,p,obj)│    │ description     │     │ scope_type      │
+└─────────────────┘     │ examples (JSON) │     │ scope_id        │
+                        │ hit_count       │     │ old_value (JSON)│
+┌──────────────────────┐│ last_hit        │     │ new_value (JSON)│
+│  ToolExecutionLog    ││ created_at      │     └─────────────────┘
+├──────────────────────┤│ created_by      │
+│ id (PK, auto)        ││ updated_at      │     ┌─────────────────┐
+│ session_id (idx)     ││ ttl_days        │     │  TopicThread     │
+│ request_id           ││ active          │     ├─────────────────┤
+│ step                 ││ priority        │     │ topic_id (PK)   │
+│ trigger              ││ confidence      │     │ session_id (idx) │
+│ tool_name            ││ allow_forced_exec│    │ status          │
+│ arguments (JSON)     ││ UQ:(scope,hash) │     │ summary         │
+│ result_summary       │└─────────────────┘     │ participants    │
+│ error                │                        │ created_at      │
+│ created_at           │                        │ last_active_at  │
+└──────────────────────┘                        └─────────────────┘
 ```
 
-### 3.2 表设计理念
+**关键约束**：
+- `ChatHistory`: `UNIQUE(session_id, message_fingerprint)` — 幂等写入，`ON CONFLICT DO NOTHING`
+- `UserTrait`: `UNIQUE(session_id, user_id, content)` — 同一用户同一特征只保留一行
+- `Relation`: `UNIQUE(session_id, subject_entity, predicate, object_entity)` — 三元组唯一
 
-| 表 | 设计理念 |
-|---|---|
-| **ChatHistory** | 每条消息独立一行，支持增量总结（`is_summarized` 游标）和溯源 |
-| **GroupMemory** | 每个 session 一行的宏观摘要，upsert 更新 |
-| **UserTrait** | 每条特征独立一行，支持置信度和逻辑删除（`is_active`） |
-| **CompactionJournal** | 压缩任务状态机（pending→running→success/dead），支持僵尸恢复 |
-| **Entity** | 知识图谱节点，`attributes` 为自由 JSON |
-| **Relation** | 知识图谱三元组（S-P-O），唯一约束防重，`evidence_msg_ids` 合并去重 |
-| **CustomRule** | 动态关键词规则，软删除（`active` 标记），TTL 自动过期 |
-| **RuleChangelog** | 规则变更审计日志，记录 old/new 值 |
-| **ToolExecutionLog** | 突变日志：仅记录状态变更操作，`trigger` 区分调用来源 |
+### 2.2 长期记忆沉淀：Topic Harvester（唯一机制）
 
-### 3.3 时间衰减机制
+旧的 15 条消息触发压缩机制（`process_session_memory` / `SUMMARY_THRESHOLD`）已移除（"双重抽税"问题）。**Topic Harvester 是系统唯一的长期记忆沉淀中枢。**
 
-关系（Relation）的置信度随时间自然淡化：
+`MemoryService` 保留为骨架类（生命周期接口供 `__init__.py` 调用），其 `start_consumer()` 为 no-op，不再启动 worker。
+
+```
+Topic Harvester（唯一长期记忆路径）
+
+话题归档 (SUSPENDED → ARCHIVED)
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  _archive_topic()                                    │
+│                                                      │
+│  并行执行:                                           │
+│    ① _generate_topic_summary()  → ≤200 字归档摘要    │
+│    ② _extract_lore_from_topic() → JSON 设定条目      │
+│                                                      │
+│  设定条目 → draft_worldbook.json（草稿箱）            │
+│  → Web 控制台「世界书」标签 → 管理员审核              │
+│                                                      │
+│  摘要 → TopicThread.summary 字段                     │
+└──────────────────────────────────────────────────────┘
+```
+
+**已废弃的路径**（代码残留但无调用方）：
+
+| 方法 | 位置 | 状态 |
+|------|------|------|
+| `process_session_memory` | `memory_service.py` | 已删除 |
+| `_build_memory_snapshot` | `agent_service.py` | 已删除，`snapshot` 固定为 `{}` |
+| `_build_extra_blocks_from_snapshot` | `prompt_adapter.py` | 保留但返回 `[]` |
+| `upsert_user_traits` | `memory_repo.py` | 死代码，无调用方 |
+| `upsert_relations` | `memory_repo.py` | 死代码，无调用方 |
+| `get_relations_with_decay` | `memory_repo.py` | 死代码，无调用方 |
+| `get_memory_snapshot` | `memory_repo.py` | 死代码，无调用方 |
+
+### 2.3 UserTrait 与 Relation 的 Upsert 语义（Legacy）
+
+> **注意**：以下方法仍存在于 `memory_repo.py` 中，但自压缩机制移除后已无调用方。保留代码供未来参考或复用。
+
+**UserTrait Upsert**（`memory_repo.py:upsert_user_traits`）：
+
+```sql
+INSERT INTO user_trait (trait_id, session_id, user_id, content, confidence, ...)
+VALUES (?, ?, ?, ?, ?, ...)
+ON CONFLICT (session_id, user_id, content) DO UPDATE SET
+    confidence = MAX(user_trait.confidence, excluded.confidence),
+    updated_at = excluded.updated_at,
+    source_msg_id = COALESCE(excluded.source_msg_id, user_trait.source_msg_id)
+```
+
+核心语义：**置信度只升不降**。
+
+**Relation Upsert**（`memory_repo.py:upsert_relations`）：
+
+三元组 `(session_id, subject_entity, predicate, object_entity)` 构成唯一键。冲突时 `confidence` 取较高值，`evidence_msg_ids` 合并去重。
+
+### 2.4 时间衰减机制（Legacy）
+
+> **注意**：`get_relations_with_decay` 仍存在于 `memory_repo.py`，但自压缩机制移除后已无调用方。`agent_service.py` 不再组装 `memorySnapshot`（固定为 `{}`）。
+
+关系置信度随时间自然淡化：
 
 ```
 effective_confidence = confidence × 0.5 ^ (age_days / half_life_days)
 ```
 
-- **默认半衰期**：30 天
-- **过滤阈值**：`effective_confidence < 0.15` 的关系自动排除
-- **实现位置**：`MemoryRepository.get_relations_with_decay()`
+- 默认半衰期：30 天
+- 过滤阈值：`effective_confidence < 0.15` 的关系自动排除
 
 ---
 
-## 4. 双脑协作架构
+## 3. 世界书与动态设定系统
 
-### 4.1 Prompt 编译流程
+### 3.1 静态世界书 (WorldBook)
+
+`WorldBook`（`world_book.py`）提供基于关键词的静态词条匹配：
 
 ```
-用户消息
-    │
-    ▼
-┌─ 逻辑脑（PromptAdapter.compile_logic_prompt）───────────────┐
-│  · 极简调度指令：分析意图，决定是否调用工具                      │
-│  · 注入：group_dynamics + group_memory + dynamic_rule         │
-│  · 无角色扮演设定（include_role_play_setting=False）           │
-│  · 可调用 AgentToolRegistry 中的工具                          │
+config/worldbook.json
+       │
+       ▼ (mtime 热重载，每次 search() 检查)
+┌──────────────────────────────────────────────────┐
+│  遍历 entries[]                                  │
+│                                                  │
+│  对每个 entry:                                   │
+│    1. 作用域过滤                                  │
+│       custom_scope ≠ "global" && ≠ group_id → 跳过│
+│                                                  │
+│    2. constant=True → 无条件注入                  │
+│                                                  │
+│    3. constant=False → 关键词匹配                 │
+│       any(k.lower() in text_lower for k in keys) │
+│       命中 → 注入 content                        │
+└──────────────────────────────────────────────────┘
+```
+
+**词条结构**：
+
+```json
+{
+  "uid": 1,
+  "key": ["关键词1", "关键词2"],
+  "content": "设定描述文本",
+  "constant": false,
+  "custom_scope": "global"
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `key` | 触发关键词数组，任意子串命中即激活 |
+| `constant` | `true` 时无条件注入（忽略 key） |
+| `custom_scope` | `"global"` 对所有群生效；指定 group_id 则仅限该群 |
+
+### 3.2 语义向量检索 (Semantic Lorebook)
+
+在关键词匹配之上，系统支持基于向量相似度的语义检索（`utils/embedding.py`）：
+
+```
+用户消息文本
+       │
+       ▼
+┌──────────────────────────────────┐
+│  Stage 1: FAISS Recall           │
+│  · L2 归一化 + IndexFlatIP       │
+│  · 内积 = 余弦相似度             │
+│  · Top-10 召回                   │
+└──────────────┬───────────────────┘
+               │
+               ▼ (可选)
+┌──────────────────────────────────┐
+│  Stage 2: Reranker Precision     │
+│  · SiliconFlow Reranker API      │
+│  · 对 Top-10 重排序              │
+└──────────────────────────────────┘
+```
+
+降级策略：FAISS 未安装 / API Key 缺失 / worldbook.json 不存在 → 静默跳过，不影响主链路。
+
+### 3.3 SillyTavern Lorebook 引擎
+
+`LorebookEngine`（`engine/lorebook_engine.py`）实现兼容 SillyTavern 的关键词扫描协议：
+
+- **负向关键词**：前缀 `-` 实现否决（如 `-cat` 排除含 cat 的条目）
+- **主关键词**：ANY 逻辑（任一命中即激活）
+- **副关键词逻辑门**：`AND_ANY`、`NOT_ALL`、`NOT_ANY`、`AND_ALL`
+- **递归级联**：已激活条目的 content 回馈扫描缓冲区，最深 `max_depth=10`
+- **位置分类**：按 `(order ASC, depth ASC, content ASC)` 排序，分入 `wi_before` / `wi_after` / `wi_depth`
+
+### 3.4 Topic Harvester：自动设定收割
+
+话题归档时，系统自动从对话中提炼世界观设定，写入草稿箱等待人工审核：
+
+```
+话题 SUSPENDED 超过 30 分钟
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  _archive_topic() [受信号量限流，最多 2 并发]         │
+│                                                      │
+│  1. 拉取话题全量消息                                  │
+│                                                      │
+│  2. 并行执行:                                        │
+│     ┌─────────────────┐  ┌──────────────────────────┐│
+│     │ _generate_topic  │  │ _extract_lore_from_topic ││
+│     │ _summary()       │  │ ()                       ││
+│     │                  │  │                          ││
+│     │ LLM 生成 ≤200字  │  │ LLM JSON Mode 输出:     ││
+│     │ 归档摘要          │  │ {"entries": [            ││
+│     │                  │  │   {"key": [...],         ││
+│     │                  │  │    "content": "...",     ││
+│     │                  │  │    "constant": false}    ││
+│     │                  │  │ ]}                       ││
+│     └─────────────────┘  └──────────────────────────┘│
+│                                                      │
+│  3. 提炼结果写入 draft_worldbook.json                 │
+│     · 每条附加 custom_scope = session_id              │
+│     · 线程安全 (asyncio.Lock)                        │
+│     · 自动递增 UID                                   │
+│                                                      │
+│  4. 通知 superusers 审核                              │
+│     · 获取 Bot 实例：最多 3 次重试（间隔 5s）         │
+│     · 发送私信：无重试，失败记 warning                │
+│                                                      │
+│  5. 更新话题状态 → ARCHIVED                          │
+└──────────────────────────────────────────────────────┘
+```
+
+**提炼策略**（System Prompt 摘要）：
+
+| 提取 | 不提取 |
+|------|--------|
+| 世界观：地名、组织、势力、规则体系 | 打招呼、表情包 |
+| 人物设定：角色名、身份、能力、外貌 | 一次性闲聊 |
+| 专有名词：术语、道具、技能名 | 无意义回复 |
+| 关系网络：师徒、敌对、队友等固定关系 | |
+| 重要事件：有长期影响的事件 | |
+
+原则：**宁可多提，不要漏提**。让管理员在 Web 端审核时丢弃，而非遗漏重要设定。
+
+**草稿审批闭环**：
+
+```
+Topic Harvester → draft_worldbook.json → Web 控制台「世界书」标签
+                                              │
+                                    ┌─────────┴─────────┐
+                                    ▼                   ▼
+                              批准 (Approve)        拒绝 (Reject)
+                              分配新正式 UID        从草稿箱删除
+                              追加到 worldbook.json
+                              清理 custom_scope
+```
+
+---
+
+## 4. 动态上下文与 Token 仲裁
+
+### 4.1 Prompt 组装流程
+
+`PromptPipeline`（`engine/prompt_builder.py`）负责将所有上下文组装为最终 Prompt：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  PromptPipeline.build()                                      │
+│                                                              │
+│  1. 角色卡 (CharacterCard)                                   │
+│     ├─ system prompt (name + description + personality)      │
+│     └─ 宏替换 ({{user}}, {{char}}, {{time}}, ...)           │
+│                                                              │
+│  2. Depth Injection                                          │
+│     └─ 在指定 depth 插入历史消息                             │
+│                                                              │
+│  3. SystemBlock 组装                                         │
+│     ├─ logic_directives / actor_world_knowledge              │
+│     ├─ shadow_context (影子上下文, never_cut)                │
+│     ├─ dynamic_rule (匹配的动态规则, never_cut)              │
+│     ├─ session_lifecycle (生命周期感知, never_cut)           │
+│     └─ system_tool_result (工具执行结果, never_cut)          │
+│                                                              │
+│  已废弃（_build_extra_blocks_from_snapshot 返回 []）：        │
+│     · group_dynamics (社交关系网, Priority 4) — 不再注入     │
+│     · group_memory (群友画像, Priority 5) — 不再注入         │
+│                                                              │
+│  4. TokenArbitrator 裁剪                                     │
+│     └─ 超预算时按优先级裁剪                                  │
+│                                                              │
+│  5. 输出 ChatMessage[] → to_openai_format()                  │
 └──────────────────────────────────────────────────────────────┘
-    │ (工具执行结果 → system_notification)
-    ▼
-┌─ 演员脑（PromptAdapter.compile_actor_prompt）────────────────┐
-│  · 完整角色卡 + 世界书 + 宏替换                                │
-│  · 注入：影子上下文（ShadowContext）                            │
-│  · 注入：system_notification（工具执行结果）                    │
-│  · 注入：dynamic_rule（如有匹配）                              │
-│  · 无工具访问（纯文本生成）                                     │
+```
+
+### 4.2 TokenArbitrator 裁剪机制
+
+**优先级层次**（`engine/token_budget.py`）：
+
+```
+Priority 1: SYSTEM_DIRECTIVES  ──→  never_cut = True  (永不裁剪)
+Priority 2: ROLE_PLAY_SETTING  ──→  never_cut = True  (永不裁剪)
+Priority 3: CHAT_HISTORY       ──→  shift from oldest (从最旧开始移除)
+Priority 4: GROUP_DYNAMICS     ──→  pop items from end (从末尾弹出)
+Priority 5: GROUP_MEMORY       ──→  pop items from end (从末尾弹出)
+Priority 6: WORLD_KNOWLEDGE    ──→  pop items from end (从末尾弹出)
+```
+
+**裁剪循环**（`_trim_loop`）：
+
+```
+while estimate > budget:
+    for block in trimmable_blocks (priority DESC):
+        if block.has_items:
+            block.items.pop()          # 弹出最后一个 item
+        elif block == CHAT_HISTORY:
+            shift from oldest          # 移除最旧消息
+            (保留 min_recent 条最近消息)
+        estimate = re-estimate()
+        if estimate <= budget:
+            break
+
+if still exceeds budget:
+    _forced_fallback()                 # 剥离所有可裁剪内容
+    仅保留 never_cut + min_recent
+
+if even that exceeds:
+    raise TokenBudgetExceeded          # 降级：注入截断通知
+```
+
+### 4.3 基于置信度的 Items 弹出策略（Legacy 设计）
+
+> **注意**：自压缩机制移除后，`group_memory` 和 `group_dynamics` 不再注入任何 SystemBlock，因此以下弹出策略虽然代码存在（`TokenArbitrator.pop()` 逻辑），但当前实际操作的 `items` 列表始终为空。
+
+`group_memory` 和 `group_dynamics` 两个 SystemBlock 使用 `items` 列表模式，条目按**置信度降序**排列：
+
+```
+group_memory.items = [
+    "[123456] 喜欢二次元 (置信度: 0.95)",    ← 高置信度，排在前面
+    "[789012] 是群管理 (置信度: 0.85)",      ← 不易被裁剪
+    "[123456] 最近在学 Python (置信度: 0.60)",
+    "[111111] 偶尔说冷笑话 (置信度: 0.40)",  ← 低置信度，排在末尾
+    "[222222] 可能是学生 (置信度: 0.30)",    ← 最先被弹出
+]
+```
+
+裁剪时 `pop()` 从末尾移除，即**低置信度条目最先牺牲**。这确保了高确信度的核心画像在 Token 预算紧张时优先保留。
+
+```
+Token 预算紧张时的裁剪顺序：
+
+  ┌─────────────────────────────────────────┐
+  │  group_memory.items                     │
+  │                                         │
+  │  [0] 置信度 0.95 ──→ 保留到最后        │
+  │  [1] 置信度 0.85 ──→ 保留              │
+  │  [2] 置信度 0.60 ──→ 保留              │
+  │  [3] 置信度 0.40 ──→ 可能被裁          │
+  │  [4] 置信度 0.30 ──→ 最先弹出 ← pop() │
+  └─────────────────────────────────────────┘
+```
+
+### 4.4 Token 计数策略
+
+两阶段计数，平衡性能与精度：
+
+| 阶段 | 方法 | 触发条件 | 精度 |
+|------|------|---------|------|
+| Phase 1 | 自适应字符比率估算 | 始终执行 | 近似（Latin 4.0, CJK 1.8, Other 3.0 chars/token） |
+| Phase 2 | `tiktoken cl100k_base` | Phase 1 接近预算时 | 精确 |
+
+`_adaptive_ratio()` 扫描文本的字符类别分布，计算加权比率，`estimate_tokens()` 用此比率除文本长度。
+
+---
+
+## 5. 日志路由系统
+
+### 5.1 Custom Callable Sink 架构
+
+系统放弃 loguru 原生的 path 模板轮转，改用 **Custom Callable Sink** 实现按身份 + 按天的动态文件分离：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  loguru logger                                               │
+│                                                              │
+│  Sink 1: 系统级兜底 (logs/chatbot.log)                       │
+│    filter: record["extra"] 中无 group_id 且无 private_user_id │
+│    rotation: 10 MB, retention: 20 files                      │
+│                                                              │
+│  Sink 2: 群聊日志 (Custom Callable)                          │
+│    filter: record["extra"] 中有 group_id                     │
+│    路径: logs/groups/{YYYY-MM-DD}_group_{gid}.log            │
+│    实现: 每条日志动态构建路径，天然按天轮转                   │
+│                                                              │
+│  Sink 3: 私聊日志 (Custom Callable)                          │
+│    filter: record["extra"] 中有 private_user_id              │
+│    路径: logs/private/{YYYY-MM-DD}_private_{uid}.log         │
+│    实现: 同上                                               │
 └──────────────────────────────────────────────────────────────┘
-    │
-    ▼
-  最终回复
 ```
 
-### 4.2 Token 预算仲裁
+### 5.2 Logger 绑定与传播
 
-当 Prompt 总长度超出模型上下文窗口时，`TokenArbitrator` 按优先级裁剪：
-
-| 优先级 | 名称 | 裁剪策略 | never_cut |
-|:------:|------|---------|:---------:|
-| 1 | `SYSTEM_DIRECTIVES` | 不裁剪 | ✅ |
-| 2 | `ROLE_PLAY_SETTING` | 不裁剪 | ✅ |
-| 3 | `CHAT_HISTORY` | 从最旧消息开始移除，保留≥2条最近消息 | ❌ |
-| 4 | `GROUP_DYNAMICS` | 从末尾弹出 items | ❌ |
-| 5 | `GROUP_MEMORY` | 从末尾弹出 items | ❌ |
-| 6 | `WORLD_KNOWLEDGE` | 从末尾弹出 items | ❌ |
-
-裁剪分两阶段：Phase 1 使用 `len(text)/3.35` 快速估算；Phase 2 使用 `tiktoken` 精确验证。
-
-### 4.3 影子上下文（Shadow Context）
+在 `chat_entry.py` 入口处，logger 被绑定上下文：
 
 ```python
-class ShadowContext:  # 单例
-    _queues: TTLCache[session_id → deque(maxlen=5)]  # TTL=86400s
-
-    def push(session_id, fact)       # 控制面操作后调用
-    def get_recent(session_id, n=3)  # 演员脑编译时读取
+if is_group:
+    chat_logger = logger.bind(group_id=group_id)
+else:
+    chat_logger = logger.bind(private_user_id=user_id)
 ```
 
-注入位置：`compile_actor_prompt()` 中，以 `Priority.SYSTEM_DIRECTIVES` + `never_cut=True` 的 `SystemBlock` 注入，确保演员脑始终可见。
+此绑定沿调用链自动传播——loguru 的 `bind()` 返回新 logger 实例，下游服务接收并使用该实例即可继承 `extra` 字段。注意：如果下游服务直接使用模块级 `from nonebot.log import logger` 而非接收绑定后的实例，则不会继承路由上下文。
+
+### 5.3 文件命名与轮转
+
+```
+logs/
+├── chatbot.log                           # 系统级（10MB 轮转，保留 20 个）
+├── groups/
+│   ├── 2026-05-12_group_123456.log       # 按天 × 群 自动创建
+│   ├── 2026-05-12_group_789012.log
+│   └── 2026-05-11_group_123456.log       # 旧日期文件自然沉淀
+└── private/
+    ├── 2026-05-12_private_111111.log     # 按天 × 用户 自动创建
+    └── 2026-05-11_private_111111.log
+```
+
+无需外部轮转配置（如 logrotate），Custom Sink 按日期动态创建新文件，旧文件自然沉淀。物理清理由运维按需执行。
 
 ---
 
-## 5. 强指令系统（Alconna 协议）
+## 6. Web 控制台与配置热重载
 
-### 5.1 指令定义
+### 6.1 零信任架构
 
-所有管理指令在 `matchers/admin_hard.py` 中通过 `Alconna` 类定义：
-
-```python
-cmd_leave          = Alconna("退群")
-cmd_activity       = Alconna("调整活跃度", Args["prob", str])
-cmd_dive           = Alconna("潜水模式", Args["action", ["开启", "关闭"]])
-cmd_draw_whitelist = Alconna("授权画图", Args["targets", At, ...])
-cmd_ban            = Alconna("禁言", Args["target", At]["duration", int, 600])
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Web 管理面板 (127.0.0.1:8081)                               │
+│                                                              │
+│  启动方式：daemon 线程（随主进程退出）                        │
+│  服务端：stdlib HTTPServer                                    │
+│                                                              │
+│  ┌─────────────┐         ┌──────────────────────────────┐   │
+│  │  前端 SPA    │  ←→     │  后端 API (ConfigAPIHandler) │   │
+│  │ index.html   │  HTTP   │                              │   │
+│  │ (单文件)     │         │  GET /api/config             │   │
+│  │              │         │  POST /api/config            │   │
+│  │ 3 个 Tab:    │         │  GET /api/worldbook          │   │
+│  │ · 全局设置   │         │  POST /api/worldbook/save    │   │
+│  │ · 群管理     │         │  POST /api/worldbook/draft/  │   │
+│  │ · 世界书     │         │      approve | reject        │   │
+│  └─────────────┘         └──────────────────────────────┘   │
+│                                                              │
+│  鉴权：                                                     │
+│    · Token = secrets.token_urlsafe(32)（每次重启重新生成）   │
+│    · 注入方式：HTML <meta name="admin-token">               │
+│    · 前端读取后立即 .remove()（一次性消费）                  │
+│    · API 请求：Authorization: Bearer <token>                │
+│    · 防时序攻击：secrets.compare_digest                      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 Matcher 注册
+### 6.2 功能清单
 
-所有指令注册时设置 `priority=3, block=True`：
+| 功能 | 端点 | 说明 |
+|------|------|------|
+| 查看全局配置 | `GET /api/config` | 返回所有 `Config` 字段为 JSON |
+| 修改配置 | `POST /api/config` | 类型校验 → 候选构建 → 原子落盘 → 内存刷新 |
+| 查看世界书 | `GET /api/worldbook` | 返回 `entries`（正式）+ `drafts`（待审） |
+| 保存世界书 | `POST /api/worldbook/save` | 整体覆写正式词条 |
+| 批准草稿 | `POST /api/worldbook/draft/approve` | 草稿 → 正式（分配新 UID，清理 custom_scope） |
+| 拒绝草稿 | `POST /api/worldbook/draft/reject` | 从草稿箱删除 |
 
-```python
-admin_leave = on_alconna(cmd_leave, aliases={"leave"}, priority=3, block=True)
-admin_ban   = on_alconna(cmd_ban,   aliases={"ban"},   priority=3, block=True)
+**配置修改流程**：
+
+```
+POST /api/config (JSON body)
+       │
+       ├─ 1. 字段校验 & 类型转换
+       │     · Set 字段：列表/逗号分隔字符串 → set
+       │     · Bool 字段：字符串 "true"/"1" → True
+       │     · GroupSettings：逐 group_id 校验
+       │
+       ├─ 2. 构建候选配置 (deep copy，不更新内存)
+       │
+       ├─ 3. 原子落盘
+       │     · tempfile → yaml.dump → os.replace
+       │     · 失败则内存不更新
+       │
+       └─ 4. 落盘成功 → 更新内存 _config
 ```
 
-`block=True` 确保匹配成功后事件传播终止，`chat_entry.py`（`priority=10`）不会收到指令文本。
+### 6.3 配置热重载
 
-### 5.3 权限检查
+`ConfigManager` 使用 `watchdog.Observer` 监控 `config/` 目录：
 
-所有 handler 共享 `_check_privilege(bot, event)` 函数，通过 `PermissionService.has_command_privilege()` 验证用户身份（超管 / AI 管理员 / 群管理）。
+```
+config/*.yaml 文件变动
+       │
+       ▼ (FileSystemEventHandler)
+  等待 0.5 秒（防抖）
+       │
+       ▼
+  load_config()
+       │
+       ├─ 读取 YAML
+       ├─ Pydantic 校验
+       ├─ 深拷贝合并（仅更新 YAML 中显式出现的键）
+       └─ 替换内存中的 _config 对象
+```
+
+**世界书热重载**：`WorldBook.search()` 每次调用时检查文件 mtime，变动则重新加载，无需重启。
+
+### 6.4 后台守护进程总览
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  @driver.on_startup 启动的后台任务                           │
+│                                                              │
+│  #. 任务                          间隔       自愈包装        │
+│  ─────────────────────────────────────────────────────────── │
+│  1. MemoryCircuitBreaker.monitor  10s       裸协程 (raw)     │
+│  2. EventLoopMonitor.start        1s        裸协程 (raw)     │
+│  3. MemoryService.start_consumer  —         no-op（已废弃）  │
+│  4. chat_entry._cleanup_sessions  10min     裸协程 (raw)     │
+│  5. topic_harvester_daemon        60s       run_with_self_heal│
+│  6. ttl_cleanup_loop              86400s    run_with_self_heal│
+│  7. start_config_web_server       —         daemon 线程      │
+│                                                              │
+│  run_with_self_heal() 包装：                                 │
+│    · 异常捕获 → 紧急告警 → 5 秒后自动重启                   │
+│    · CancelledError → 正常退出                               │
+│                                                              │
+│  仅 #5、#6 使用了自愈包装；#1/#2/#4 为裸协程，              │
+│  异常后不会自动重启（需依赖进程级重启）。                    │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 6. 突变日志（Mutation Logs）
-
-### 6.1 设计动机
-
-传统日志记录所有工具调用，包括只读查询（`search_acg_image`）和内部信号（`mark_task_complete`），导致审计表噪声过高。V3 引入 `is_write_operation` 标记，仅记录状态变更操作。
-
-### 6.2 写入路径
-
-| 调用来源 | 写入位置 | trigger 值 |
-|---------|---------|-----------|
-| 硬指令短路（`/jm` 等） | `agent_service.py` Site 1 | `"forced_shortcut"` |
-| 逻辑脑 LLM 循环 | `agent_service.py` Site 2 | `"llm"` |
-| 单脑模式循环 | `agent_service.py` Site 3 | `"llm"` |
-| 控制面（禁言） | `admin_tool.py` 显式调用 | `"control_plane"` |
-
-所有路径均检查 `tool.is_write_operation`，仅当为 `True` 时才调用 `insert_tool_log()`。
-
-### 6.3 查询接口
-
-```python
-async def get_recent_tool_logs(session_id: str, limit: int = 20) -> List[Dict]
-```
-
-返回指定 session 最近的突变日志条目，按 `id` 降序排列。
-
----
-
-## 7. 配置管理
-
-### 7.1 原子化写入
-
-```
-save_config(data)
-    │
-    ├─ 1. tempfile.mkstemp() → 创建临时文件
-    ├─ 2. yaml.dump() → 写入临时文件
-    ├─ 3. os.replace() → 原子性替换目标文件
-    ├─ 4. _version += 1 → 递增版本计数器
-    └─ 5. 仅当上述全部成功 → 更新内存 _config
-```
-
-Web API 的 `do_POST` 遵循相同策略：先构建候选配置（`candidate`），序列化为 `payload`，落盘成功后才更新内存。
-
-### 7.2 热重载
-
-`watchdog.Observer` 监控 `config/` 目录，文件修改后 0.5 秒延迟触发 `load_config()`。`load_config()` 采用深拷贝方案：仅更新 YAML 中显式出现的键，未出现的键保留当前值。
-
-### 7.3 零信任 Web 面板
-
-- 每次 Python 重启生成新 Token（`secrets.token_urlsafe(32)`）
-- HTML 通过 `<meta>` 标签注入 Token，前端读取后立即 `.remove()`
-- 所有 API 请求需 `Authorization: Bearer <token>`
-- 使用 `secrets.compare_digest` 防时序攻击
-
----
-
-## 8. Feature Flag 机制
+## 附录：Feature Flags
 
 | Flag | 默认值 | 控制内容 |
 |------|:------:|---------|
-| `enable_dual_brain` | `True` | 双脑模式开关（关闭则使用单脑 ReAct） |
-| `enable_strict_schema` | `True` | Pydantic Schema 校验 |
-| `enable_task_queue` | `False` | 记忆压缩走队列（持久化+重试）还是直接 create_task |
-| `enable_dynamic_loop` | `False` | Jaccard 重复检测 + `mark_task_complete` 工具注册 |
-| `entity_relation_enabled` | `False` | 是否查询衰减关系并注入 memorySnapshot |
-| `semantic_lorebook_enabled` | `False` | 是否启用语义向量检索 |
+| `enable_dual_brain` | `True` | 双脑模式（关闭则退化为单脑 ReAct） |
+| `enable_task_queue` | `False` | ~~记忆压缩走持久化队列 vs 火后不管~~（压缩机制已移除，此 flag 当前无实际效果） |
+| `entity_relation_enabled` | `False` | ~~是否查询衰减关系注入 memorySnapshot~~（注入路径已移除，此 flag 当前无实际效果） |
+| `semantic_lorebook_enabled` | `False` | 是否启用 FAISS 语义向量检索 |
 | `token_arbitration_enabled` | `False` | 是否启用 Token 优先级裁剪 |
 
 ---
 
-## 9. 性能与可靠性
-
-### 9.1 事件循环保护
-
-CPU/IO 密集型同步操作通过 `asyncio.to_thread()` 或 `loop.run_in_executor()` 卸载到线程池，避免阻塞 NoneBot 主事件循环。
-
-### 9.2 记忆压缩熔断器
-
-`MemoryCircuitBreaker` 监控压缩 worker 的健康状态。当 worker 崩溃时，`on_worker_dead` 回调自动重启 worker 协程。`EventLoopMonitor` 检测事件循环漂移（阈值 1.5 秒）。
-
-### 9.3 自愈机制
-
-`run_with_self_heal(name, coro_func)` 将协程包装在无限重试循环中（5 秒退避），崩溃时通过 `alert_manager` 发送紧急告警。
-
----
-
-## 10. 数据模型 ER 图（完整）
-
-```
-┌──────────────────┐
-│  ToolExecutionLog │  ← 突变日志（仅 is_write_operation=True）
-├──────────────────┤
-│ id (PK)          │
-│ session_id (idx) │
-│ request_id       │
-│ step             │
-│ trigger          │  "llm" / "forced_shortcut" / "control_plane"
-│ tool_name        │
-│ arguments (JSON) │
-│ result_summary   │
-│ error            │
-│ created_at       │
-└──────────────────┘
-```
-
-> 注：`ToolExecutionLog` 表仅记录状态变更操作。只读工具（`search_acg_image`、`recommend_book`）和内部信号（`mark_task_complete`）的调用不会写入此表。
+*本文档基于源码全局审阅生成，反映 2026-05-12 的系统状态。已根据压缩机制移除后的实际代码校正。*

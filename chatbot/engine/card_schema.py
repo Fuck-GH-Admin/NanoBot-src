@@ -189,7 +189,7 @@ class CharacterCard(BaseModel):
                 data[dst] = inner[src]
 
         # Extensions mapping
-        ext = inner.get("extensions", {})
+        ext = inner.get("extensions") or {}
         if isinstance(ext, dict):
             if "talkativeness" in ext and "talkativeness" not in data:
                 data["talkativeness"] = ext["talkativeness"]

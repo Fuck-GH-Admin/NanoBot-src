@@ -25,12 +25,29 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class TopicThread(Base):
+    """话题线程（蚂蚁洞室）：管理多线程对话的生命周期"""
+    __tablename__ = "topic_thread"
+
+    topic_id: Mapped[str] = mapped_column(String(32), primary_key=True)  # UUID hex
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="ACTIVE")  # ACTIVE, SUSPENDED, ARCHIVED
+    summary: Mapped[str] = mapped_column(Text, default="")
+    participants: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[str] = mapped_column(String(32), default=_utc_now_iso)
+    last_active_at: Mapped[str] = mapped_column(String(32), default=_utc_now_iso)
+
+    def __repr__(self) -> str:
+        return f"<TopicThread {self.topic_id} status={self.status}>"
+
+
 class ChatHistory(Base):
     """对话流水账：每条消息独立一行，支持溯源与增量总结"""
     __tablename__ = "chat_history"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    topic_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False)  # user/assistant/system/tool
     user_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     name: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -38,9 +55,11 @@ class ChatHistory(Base):
     timestamp: Mapped[str] = mapped_column(String(32), nullable=False, default=_utc_now_iso)
     is_summarized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     tool_calls: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    message_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_chat_history_session_ts", "session_id", "timestamp"),
+        UniqueConstraint("session_id", "message_fingerprint", name="uq_chat_fingerprint"),
     )
 
     def __repr__(self) -> str:

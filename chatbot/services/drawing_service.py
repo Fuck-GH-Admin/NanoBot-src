@@ -94,9 +94,9 @@ class DrawingService:
                 return simple_prompt
 
             data = resp.json()
-            choices = data.get("choices", [])
+            choices = data.get("choices") or []
             if choices:
-                return choices[0].get("message", {}).get("content", simple_prompt)
+                return (choices[0].get("message") or {}).get("content", simple_prompt)
         return simple_prompt
 
     async def _call_siliconflow(self, prompt: str, user_id: str) -> str:
@@ -129,7 +129,7 @@ class DrawingService:
 
                 data = await resp.json()
 
-                data_list = data.get("data", [])
+                data_list = data.get("data") or []
                 if data_list and isinstance(data_list, list):
                     img_url = data_list[0].get("url")
                 else:

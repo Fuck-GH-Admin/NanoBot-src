@@ -1,191 +1,45 @@
 # src/plugins/chatbot/services/memory_service.py
+#
+# 长期记忆沉淀中枢：仅保留 Topic Harvester（话题归档时触发 LLM 提炼）。
+# 旧的 15 条消息触发压缩机制已移除（双重抽税问题）。
 
 import asyncio
 import json
-import uuid
-from typing import Dict, List, Any
+import time
+from pathlib import Path
 
 import httpx
-from sqlalchemy import select
 from nonebot.log import logger
 
 from ..config import plugin_config
+from ..utils.path_utils import get_project_root, DRAFT_WORLDBOOK_PATH
 from ..repositories.memory_repo import MemoryRepository
-from ..repositories.models import CompactionJournal
-from ..utils.alert_manager import send_emergency_alert
 
 
-# ─────────────────── 常量 ───────────────────
-SUMMARY_THRESHOLD = 15
-MAX_RETRIES = 3
-BACKOFF_BASE = 2          # 指数退避基数（秒）
-CONCURRENCY_LIMIT = 2     # 同时执行 _do_process 的最大协程数
-STALE_SECONDS = 300       # 僵尸任务判定阈值（秒）
-
-# Function Calling 工具定义：强制 LLM 结构化输出
-MEMORY_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "update_memory_graph",
-        "description": (
-            "更新群组的记忆图谱。必须调用此工具来输出结构化的记忆更新。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "group_summary": {
-                    "type": "string",
-                    "description": "对群组整体事件的客观摘要，提取关键信息、事件发展和重要结论。",
-                },
-                "user_traits": {
-                    "type": "array",
-                    "description": "从对话中提取到的群友特征列表。",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "user_id": {
-                                "type": "string",
-                                "description": "用户的唯一数字 ID（QQ 号）",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "提取到的特征内容，如喜好、性格、关系等",
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "description": "置信度 0-1，根据对话内容的明确程度判断",
-                            },
-                        },
-                        "required": ["user_id", "content", "confidence"],
-                    },
-                },
-                "entities": {
-                    "type": "array",
-                    "description": "对话中提及的新实体或需要更新的实体",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "entity_id": {
-                                "type": "string",
-                                "description": "实体的唯一标识（可用QQ号加前缀，如 user_12345）",
-                            },
-                            "name": {"type": "string"},
-                            "type": {
-                                "type": "string",
-                                "enum": ["person", "object", "location", "event", "concept"],
-                            },
-                            "attributes": {
-                                "type": "object",
-                                "description": "实体附加属性",
-                            },
-                        },
-                        "required": ["entity_id", "name", "type"],
-                    },
-                },
-                "relations": {
-                    "type": "array",
-                    "description": "实体之间的关系或关系变更",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "subject_entity": {
-                                "type": "string",
-                                "description": "主体实体ID",
-                            },
-                            "predicate": {
-                                "type": "string",
-                                "description": "谓语，如 likes, trusts, member_of",
-                            },
-                            "object_entity": {
-                                "type": "string",
-                                "description": "客体实体ID",
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 1,
-                            },
-                            "evidence_msg_ids": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "佐证消息的ID",
-                            },
-                        },
-                        "required": [
-                            "subject_entity",
-                            "predicate",
-                            "object_entity",
-                            "confidence",
-                        ],
-                    },
-                },
-            },
-            "required": ["group_summary", "user_traits"],
-        },
-    },
-}
-
+# ─────────────────── 压缩机制已废弃 ───────────────────
+# 旧的 15 条消息触发压缩（GroupMemory/UserTrait/Entity/Relation）已移除。
+# 唯一的长期记忆沉淀中枢是 Topic Harvester（话题归档时触发）。
+# MemoryService 类保留骨架以兼容 __init__.py 中的启动/关闭代码。
 
 class MemoryService:
-    """
-    后台记忆特工（高可用版）
-
-    - asyncio.Queue + 单消费者协程（_worker），有序出队
-    - Semaphore 限流，防止并发 LLM 调用过多
-    - 指数退避重试（最多 MAX_RETRIES 次），超限进入死信队列（_dlq）
-    - CompactionJournal 表持久化任务状态，支持僵尸任务恢复
-    - graceful shutdown：drain 队列 → 等待 worker 结束 → 关闭 httpx
-    """
+    """记忆服务骨架（压缩逻辑已移除，仅保留生命周期接口供 __init__.py 调用）。"""
 
     def __init__(self):
         self.repo = MemoryRepository()
         self.http_client = httpx.AsyncClient(timeout=90.0)
-
-        # ── 队列 & 控制 ──
+        # 保留 _queue 以兼容 __init__.py 中 circuit_breaker 对 qsize() 的访问
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._running = False
         self._worker_task: asyncio.Task | None = None
-        self._concurrency_limiter = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-        # ── 死信队列（内存，仅供运维观测） ──
-        self._dlq: List[Dict[str, Any]] = []
-
-        # ── per-session 互斥（防止同一 session 并发压缩） ──
-        self._locks: Dict[str, asyncio.Lock] = {}
-        self._global_lock = asyncio.Lock()
-
-    # ─────────────── 生命周期 ───────────────
 
     async def start_consumer(self) -> None:
-        """启动消费者协程（在 on_startup 中调用）。"""
-        if self._running:
-            return
+        """保留接口（no-op）。压缩机制已废弃，无消费者需要启动。"""
         self._running = True
-        self._worker_task = asyncio.create_task(self._worker())
-        logger.info("[MemoryService] 消费者协程已启动")
-
-        # 恢复僵尸任务
-        await self._recover_stale_journals()
+        logger.info("[MemoryService] 压缩机制已废弃，消费者接口保留但不启动 worker")
 
     async def shutdown(self) -> None:
-        """优雅关闭：停止接受新任务 → drain 队列 → 等待 worker → 关闭 httpx。"""
-        logger.info("[MemoryService] 正在优雅关闭...")
+        """优雅关闭 httpx 连接池。"""
         self._running = False
-
-        # 等待队列清空（最多 30 秒）
-        try:
-            await asyncio.wait_for(self._queue.join(), timeout=30)
-        except asyncio.TimeoutError:
-            logger.warning("[MemoryService] 队列 drain 超时，强制退出")
-
-        # 取消 worker
-        if self._worker_task and not self._worker_task.done():
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-
         await self.http_client.aclose()
         logger.info("[MemoryService] 已关闭")
 
@@ -193,418 +47,406 @@ class MemoryService:
         """兼容旧接口，委托给 shutdown。"""
         await self.shutdown()
 
-    # ─────────────── 僵尸任务恢复 ───────────────
 
-    async def _recover_stale_journals(self) -> None:
-        """启动时扫描 CompactionJournal 中的僵尸 running 任务，重新入队或标记 dead。"""
-        try:
-            stale = await self.repo.get_stale_journals(STALE_SECONDS)
-            requeue_ids = []
-            dead_ids = []
-            for j in stale:
-                if j["retry_count"] < j["max_retries"]:
-                    requeue_ids.append(j["journal_id"])
-                else:
-                    dead_ids.append(j["journal_id"])
+# ─────────────────── 话题收割机 (Topic Harvester) ───────────────────
 
-            if dead_ids:
-                await self.repo.mark_journals_failed(dead_ids)
-                for jid in dead_ids:
-                    self._dlq.append({"journal_id": jid, "reason": "stale_exhausted"})
-                logger.warning(f"[MemoryService] {len(dead_ids)} 个僵尸任务标记为 dead")
+# 话题状态机常量
+TOPIC_ACTIVE_TIMEOUT = 600       # ACTIVE → SUSPENDED：10 分钟无活动
+TOPIC_ARCHIVE_TIMEOUT = 1800     # SUSPENDED → ARCHIVED：30 分钟无活动
+HARVESTER_SCAN_INTERVAL = 60     # 扫描间隔（秒）
 
-            for jid in requeue_ids:
-                # 从 journal_id 反查 session_id（通过 stale 列表）
-                session_id = next(
-                    (j["session_id"] for j in stale if j["journal_id"] == jid), None
-                )
-                if session_id:
-                    await self._queue.put(session_id)
-                    await self.repo.update_compaction_journal(jid, status="pending")
-                    logger.info(f"[MemoryService] 僵尸任务 {jid} 已重新入队")
+# 归档限流：同时最多 2 个 LLM 摘要任务
+_ARCHIVE_SEMAPHORE = asyncio.Semaphore(2)
+# 归档冷却（秒）：每个任务完成后强制等待，防止 API 速率限制
+_ARCHIVE_COOLDOWN = 2.0
 
-        except Exception as e:
-            logger.error(f"[MemoryService] 恢复僵尸任务失败: {e}", exc_info=True)
 
-    # ─────────────── 对外接口 ───────────────
+async def _generate_topic_summary(topic_id: str, messages: list) -> str:
+    """调用 LLM 为话题生成归档摘要"""
+    api_key = plugin_config.deepseek_api_key
+    api_url = plugin_config.deepseek_api_url
+    model = plugin_config.deepseek_memory_model_name
 
-    async def process_session_memory(self, session_id: str) -> None:
-        """
-        入口：根据 enable_task_queue 决定走队列还是直接执行。
+    if not api_key or not messages:
+        return ""
 
-        - enable_task_queue=True:  入队（fire-and-forget + 持久化 + 重试）
-        - enable_task_queue=False: 直接 asyncio.create_task 调用 _do_process（轻量模式）
-        """
-        if plugin_config.enable_task_queue:
-            return await self._enqueue(session_id)
-        else:
-            # 轻量模式：fire-and-forget，无持久化、无重试
-            asyncio.create_task(self._direct_process(session_id))
+    # 构建摘要请求：只取关键消息，控制 token 用量
+    condensed = []
+    for msg in messages[-50:]:  # 最多取最后 50 条
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if content:
+            condensed.append(f"[{role}] {content[:300]}")
 
-    async def _direct_process(self, session_id: str) -> None:
-        """轻量模式：直接执行，异常仅记录日志。"""
-        try:
-            lock = await self._get_lock(session_id)
-            async with lock:
-                await self._do_process(session_id)
-        except Exception as e:
-            logger.error(f"[MemoryService] 直接处理 {session_id} 失败: {e}", exc_info=True)
+    prompt_text = "\n".join(condensed)
 
-    async def _enqueue(self, session_id: str) -> None:
-        """高可用模式：入队 + Journal 持久化。"""
-        if not self._running:
-            logger.debug("[MemoryService] 消费者未启动，跳过入队")
-            return
+    request_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是一个摘要生成器。请用简洁的中文总结以下对话的核心内容、关键结论和参与者。不超过 200 字。"},
+            {"role": "user", "content": prompt_text},
+        ],
+        "stream": False,
+        "temperature": 0.3,
+        "max_tokens": 300,
+        "thinking": {"type": "disabled"},
+    }
 
-        # 去重：检查队列中是否已有相同 session_id
-        if session_id in self._queue._queue:  # type: ignore[attr-defined]
-            logger.debug(f"[MemoryService] {session_id} 已在队列中，跳过重复入队")
-            return
-
-        # 创建 Journal 记录
-        journal_id = uuid.uuid4().hex
-        try:
-            await self.repo.insert_compaction_journal(journal_id, session_id, MAX_RETRIES)
-        except Exception as e:
-            logger.error(f"[MemoryService] 创建 Journal 失败: {e}")
-            return
-
-        await self._queue.put(session_id)
-        logger.debug(f"[MemoryService] {session_id} 已入队 (journal={journal_id})")
-
-    # ─────────────── 消费者协程 ───────────────
-
-    async def _worker(self) -> None:
-        """单消费者协程，从队列中逐个取出 session_id 并处理。"""
-        while self._running:
-            try:
-                session_id = await asyncio.wait_for(
-                    self._queue.get(), timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-
-            try:
-                await self._do_process_with_retry(session_id)
-            except Exception as e:
-                logger.error(
-                    f"[MemoryService] worker 处理 {session_id} 未捕获异常: {e}",
-                    exc_info=True,
-                )
-            finally:
-                self._queue.task_done()
-
-    # ─────────────── 带重试的核心逻辑 ───────────────
-
-    async def _do_process_with_retry(self, session_id: str) -> None:
-        """带指数退避重试的处理逻辑。失败超过 MAX_RETRIES 次进入死信队列。"""
-        # 查找对应的 journal_id（最近一条 pending/running 的记录）
-        journal_id = await self._find_active_journal(session_id)
-        if not journal_id:
-            logger.warning(f"[MemoryService] {session_id} 无活跃 Journal，跳过")
-            return
-
-        await self.repo.update_compaction_journal(journal_id, status="running")
-
-        last_error = ""
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with self._concurrency_limiter:
-                    lock = await self._get_lock(session_id)
-                    async with lock:
-                        await self._do_process(session_id)
-
-                # 成功
-                await self.repo.update_compaction_journal(
-                    journal_id, status="success", retry_count=attempt
-                )
-                logger.info(f"[MemoryService] {session_id} 记忆压缩成功 (attempt={attempt + 1})")
-                return
-
-            except Exception as e:
-                last_error = str(e)
-
-                # API 拒绝服务（402/403）：不消耗重试次数，直接退出，避免雪崩
-                if "402" in last_error or "403" in last_error:
-                    logger.error(
-                        f"[MemoryService] {session_id} API 拒绝访问，跳过重试，等待恢复"
-                    )
-                    await self.repo.update_compaction_journal(
-                        journal_id, status="pending", last_error=last_error
-                    )
-                    return
-
-                logger.warning(
-                    f"[MemoryService] {session_id} 第 {attempt + 1}/{MAX_RETRIES} 次失败: {last_error}"
-                )
-                await self.repo.update_compaction_journal(
-                    journal_id, retry_count=attempt + 1, last_error=last_error
-                )
-
-                if attempt < MAX_RETRIES - 1:
-                    backoff = BACKOFF_BASE ** attempt
-                    logger.info(f"[MemoryService] {backoff}s 后重试...")
-                    await asyncio.sleep(backoff)
-
-        # 全部重试用尽 → 死信
-        await self.repo.update_compaction_journal(journal_id, status="dead", last_error=last_error)
-        self._dlq.append({
-            "journal_id": journal_id,
-            "session_id": session_id,
-            "reason": "max_retries_exhausted",
-            "last_error": last_error,
-        })
-        logger.error(
-            f"[MemoryService] {session_id} 记忆压缩失败（已重试 {MAX_RETRIES} 次），进入死信队列"
-        )
-
-    async def _find_active_journal(self, session_id: str) -> str | None:
-        """查找该 session 最近一条 pending 或 running 状态的 journal_id。"""
-        async with self.repo._get_session() as session:
-            stmt = (
-                select(CompactionJournal.journal_id)
-                .where(
-                    CompactionJournal.session_id == session_id,
-                    CompactionJournal.status.in_(["pending", "running"]),
-                )
-                .order_by(CompactionJournal.created_at.desc())
-                .limit(1)
-            )
-            result = await session.execute(stmt)
-            return result.scalar_one_or_none()
-
-    # ─────────────── per-session 锁 ───────────────
-
-    async def _get_lock(self, session_id: str) -> asyncio.Lock:
-        """按 session_id 获取或创建锁"""
-        if session_id not in self._locks:
-            async with self._global_lock:
-                if session_id not in self._locks:
-                    self._locks[session_id] = asyncio.Lock()
-        return self._locks[session_id]
-
-    # ─────────────── 核心处理逻辑（在锁 + 信号量内执行） ───────────────
-
-    async def _do_process(self, session_id: str) -> None:
-        """核心处理逻辑"""
-
-        # 1. 获取未总结消息
-        unsummarized = await self.repo.get_unsummarized_messages(session_id)
-        if len(unsummarized) < SUMMARY_THRESHOLD:
-            logger.debug(
-                f"[MemoryService] {session_id} 未总结消息 {len(unsummarized)} 条 "
-                f"< 阈值 {SUMMARY_THRESHOLD}，跳过"
-            )
-            return
-
-        logger.info(
-            f"[MemoryService] {session_id} 触发记忆压缩，"
-            f"未总结消息 {len(unsummarized)} 条"
-        )
-
-        # 2. 获取已有的群组摘要
-        existing_summary = await self.repo.get_group_summary(session_id)
-
-        # 3. 格式化对话文本（注入 user_id 以锚定画像）
-        conversation_lines: List[str] = []
-        message_ids: List[int] = []
-        for msg in unsummarized:
-            uid = msg.get("user_id", "")
-            name = msg.get("name", "Unknown")
-            content = msg.get("content", "").strip()
-            if not content:
-                continue
-            id_prefix = f"[ID: {uid}] " if uid else ""
-            conversation_lines.append(f"{id_prefix}{name}: {content}")
-            message_ids.append(msg["id"])
-
-        if not conversation_lines:
-            return
-
-        conversation_text = "\n".join(conversation_lines)
-
-        # 4. 构建提示词
-        system_prompt = (
-            "You are a conversation analyst. Analyze the chat history below and "
-            "call the `update_memory_graph` tool to record what you learned.\n\n"
-            "Rules:\n"
-            "- Extract a factual group summary capturing key events and developments.\n"
-            "- Extract individual user traits (preferences, personality, relationships).\n"
-            "- Use the numeric user_id (in brackets like [ID: 123456]) to identify users.\n"
-            "- Assign confidence based on how explicitly the trait was expressed.\n"
-            "- Be concise. Only record genuinely new or changed traits.\n\n"
-            "Entity & Relation Extraction:\n"
-            "- Extract entities mentioned in the conversation: people (use entity_id "
-            "like `user_QQ号`), important objects, locations, events, concepts.\n"
-            "- Identify relationships between entities as Subject-Predicate-Object "
-            "triples (e.g. 'Alice likes cats', 'Bob is group admin'). "
-            "Attach a confidence score and evidence message IDs when possible.\n"
-            "- If a known relation appears with new evidence, still output it — the "
-            "system will merge automatically.\n"
-            "- Only extract genuinely new or clearly changed information; avoid "
-            "duplicates."
-        )
-
-        user_content = ""
-        if existing_summary:
-            user_content += f"Existing group summary:\n{existing_summary}\n\n"
-        user_content += f"Recent conversation to analyze:\n{conversation_text}"
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-
-        # 5. 调用 DeepSeek（带 Function Calling）
-        api_key = plugin_config.deepseek_api_key
-        api_url = plugin_config.deepseek_api_url
-        model = plugin_config.deepseek_memory_model_name
-
-        if not api_key:
-            logger.warning("[MemoryService] 未配置 deepseek_api_key，跳过记忆压缩")
-            return
-
-        request_body = {
-            "model": model,
-            "messages": messages,
-            "tools": [MEMORY_TOOL_SCHEMA],
-            "tool_choice": {"type": "function", "function": {"name": "update_memory_graph"}},
-            "stream": False,
-            "temperature": 0.3,
-            "max_tokens": 8000,
-            "thinking": {"type": "disabled"},
-        }
-
-        try:
-            resp = await self.http_client.post(
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
                 api_url,
                 json=request_body,
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {api_key}",
                 },
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    summary = choices[0].get("message", {}).get("content", "")
+                    logger.info(f"[Harvester] 话题 {topic_id[:8]} 摘要生成成功 ({len(summary)} 字符)")
+                    return summary
+            else:
+                logger.warning(f"[Harvester] 话题 {topic_id[:8]} 摘要 API 错误: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[Harvester] 话题 {topic_id[:8]} 摘要生成失败: {e}")
+
+    return ""
+
+
+def _collect_existing_keys(session_id: str) -> set[str]:
+    """从 worldbook.json + draft_worldbook.json 中收集当前作用域（含 global）的所有已知关键词。"""
+    base = get_project_root(Path(__file__)) / "config"
+    keys: set[str] = set()
+    for fname in ("worldbook.json", "draft_worldbook.json"):
+        fpath = base / fname
+        if not fpath.exists():
+            continue
+        try:
+            data = json.loads(fpath.read_text(encoding="utf-8"))
+            entries = data.get("entries", []) if isinstance(data, dict) else data
+            for e in entries:
+                scope = e.get("custom_scope", "global")
+                if scope == "global" or scope == session_id:
+                    for k in (e.get("key") or e.get("keys") or []):
+                        if isinstance(k, str) and len(k) >= 2:
+                            keys.add(k)
+        except Exception as e:
+            logger.warning(f"[Harvester] 读取 {fname} 提取已知关键词失败: {e}")
+    return keys
+
+
+async def _extract_lore_from_topic(topic_id: str, messages: list, session_id: str = "") -> list:
+    """
+    从话题对话中提炼客观设定（世界观、人物特征等）。
+    返回符合 SillyTavern 世界书格式的条目列表，无新设定则返回空列表。
+    """
+    api_key = plugin_config.deepseek_api_key
+    api_url = plugin_config.deepseek_api_url
+    model = plugin_config.deepseek_memory_model_name
+
+    if not api_key or not messages:
+        logger.info(f"[Harvester] 话题 {topic_id[:8]} 跳过提炼: api_key={'有' if api_key else '无'}, messages={len(messages)}")
+        return []
+
+    condensed = []
+    for msg in messages[-50:]:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if content:
+            condensed.append(f"[{role}] {content[:500]}")
+    prompt_text = "\n".join(condensed)
+
+    # 收集已知关键词，注入提示词实现源头去重
+    existing_keys = _collect_existing_keys(session_id) if session_id else set()
+    existing_keys_block = ""
+    if existing_keys:
+        keys_str = "、".join(sorted(existing_keys))
+        existing_keys_block = (
+            f"\n\n【已知设定关键词（本群已收录）】\n{keys_str}\n"
+        )
+
+    logger.info(
+        f"[Harvester] 话题 {topic_id[:8]} 开始提炼: "
+        f"{len(messages)} 条消息, {len(condensed)} 条有效, "
+        f"prompt 约 {len(prompt_text)} 字符, "
+        f"已知关键词 {len(existing_keys)} 个"
+    )
+
+    system_prompt = (
+        "你是一个从群聊对话中提炼持久化设定的助手。\n"
+        "请从以下对话中提取值得长期记住的设定信息。\n\n"
+        "【值得提取的内容】\n"
+        "- 世界观设定：地名、组织、势力、规则体系、历史背景\n"
+        "- 人物设定：角色名、身份、能力、外貌、性格特征、所属阵营\n"
+        "- 专有名词：特殊术语、道具、技能名及其含义\n"
+        "- 关系网络：角色间的固定关系（师徒、敌对、队友等）\n"
+        "- 重要事件：有长期影响的事件（非日常琐事）\n\n"
+        "【不需要提取的】\n"
+        "- 纯粹的打招呼、表情包、无意义回复\n"
+        "- 明显的一次性闲聊（如\"今天好困\"）\n\n"
+        "【宁可多提，不要漏提】\n"
+        "如果不确定是否算设定，倾向于提取。宁可让管理员审核时丢弃，也不要遗漏重要设定。\n"
+        f"{existing_keys_block}\n"
+        "【防重复约束 — 极度严格】\n"
+        "- **绝对禁止提取已知设定**：如果对话中提到的实体属于上述已知关键词，"
+        "且没有提供革命性的、打破常规的新细节，直接忽略，不允许生成条目。\n"
+        "- **补充优于新建**：如果对话为已知设定提供了重要补充，请提取一个包含原有核心关键词的新条目，"
+        "并在 content 中着重描写【补充细节】。\n"
+        "- **精准去重**：本次提取的多个 entries 内部，绝对不能出现描述同一实体的多条设定，"
+        "必须自行在输出前合并。\n\n"
+        "【输出格式】\n"
+        "你必须输出一个 JSON 对象，包含 `entries` 键，值为数组。每个元素格式：\n"
+        '{"entries": [{"key": ["关键词1", "关键词2"], "content": "设定描述", "constant": false}]}\n'
+        '如果没有值得提取的内容，输出：{"entries": []}'
+    )
+
+    request_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_text},
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": False,
+        "temperature": 0.3,
+        "max_tokens": 1000,
+        "thinking": {"type": "disabled"},
+    }
+
+    raw = ""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                api_url,
+                json=request_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                timeout=30.0,
             )
             if resp.status_code != 200:
-                if resp.status_code in (402, 403):
-                    asyncio.create_task(send_emergency_alert(
-                        f"⚠️ API 拒绝访问 ({resp.status_code})，记忆压缩功能不可用，请尽快检查 API 余额或风控状态。"
-                    ))
-                raise RuntimeError(
-                    f"DeepSeek API 错误 {resp.status_code}: {resp.text[:300]}"
+                logger.warning(
+                    f"[Harvester] 话题 {topic_id[:8]} API 错误: "
+                    f"status={resp.status_code}, body={resp.text[:200]}"
                 )
+                return []
 
             data = resp.json()
-        except Exception as e:
-            raise RuntimeError(f"请求 DeepSeek 失败: {e}") from e
+            choices = data.get("choices") or []
+            if not choices:
+                logger.warning(f"[Harvester] 话题 {topic_id[:8]} API 返回空 choices")
+                return []
 
-        # 6. 解析 Tool Call 返回
-        choices = data.get("choices", [])
-        if not choices:
-            logger.warning("[MemoryService] DeepSeek 返回空 choices")
-            return
+            raw = choices[0].get("message", {}).get("content", "")
+            raw = raw.strip()
+            logger.info(f"[Harvester] 话题 {topic_id[:8]} LLM 原始输出 ({len(raw)} 字符): {raw[:300]}")
 
-        message = choices[0].get("message", {})
-        tool_calls = message.get("tool_calls", [])
+            parsed = json.loads(raw)
+            entries = parsed.get("entries", [])
+            # 容错：模型偶尔返回单个对象而非数组
+            if isinstance(entries, dict):
+                entries = [entries]
+            if not isinstance(entries, list):
+                logger.warning(f"[Harvester] 话题 {topic_id[:8]} entries 非列表: {type(entries)}")
+                return []
 
-        if not tool_calls:
-            logger.warning("[MemoryService] LLM 未调用工具，跳过持久化")
-            return
+            # 字段映射 + 验证
+            valid = []
+            for i, e in enumerate(entries):
+                if not isinstance(e, dict):
+                    continue
+                keys = e.get("key") or e.get("keys") or []
+                if isinstance(keys, str):
+                    keys = [k.strip() for k in keys.split(",") if k.strip()]
+                content = str(e.get("content", "")).strip()
 
-        # 取第一个 tool call 的参数
-        tc = tool_calls[0]
-        func = tc.get("function", {})
-        arguments_str = func.get("arguments", "{}")
+                if not content:
+                    continue
+                if not keys:
+                    keys = [content[:20]]
 
-        try:
-            arguments = (
-                json.loads(arguments_str)
-                if isinstance(arguments_str, str)
-                else arguments_str
-            )
-        except json.JSONDecodeError:
-            logger.error(
-                f"[MemoryService] Tool Call 参数解析失败: {arguments_str[:200]}"
-            )
-            return
-
-        # 7. 持久化：群组摘要
-        new_summary = arguments.get("group_summary", "").strip()
-        if new_summary:
-            if existing_summary:
-                merged = f"{existing_summary}\n{new_summary}"
-            else:
-                merged = new_summary
-            await self.repo.upsert_group_summary(session_id, merged)
-            logger.info(f"[MemoryService] {session_id} 群组摘要已更新，长度 {len(merged)}")
-
-        # 8. 持久化：群友画像（按 user_id 分组批量写入）
-        user_traits = arguments.get("user_traits", [])
-        if user_traits:
-            traits_by_user: Dict[str, List[Dict[str, Any]]] = {}
-            for trait in user_traits:
-                uid = str(trait.get("user_id", "")).strip()
-                content = str(trait.get("content", "")).strip()
-                confidence = float(trait.get("confidence", 0.5))
-                if uid and content:
-                    traits_by_user.setdefault(uid, []).append(
-                        {"content": content, "confidence": confidence}
-                    )
-
-            total_written = 0
-            for uid, traits_list in traits_by_user.items():
-                count = await self.repo.upsert_user_traits(session_id, uid, traits_list)
-                total_written += count
+                valid.append({
+                    "key": keys if isinstance(keys, list) else [str(keys)],
+                    "content": content,
+                    "constant": bool(e.get("constant", False)),
+                })
 
             logger.info(
-                f"[MemoryService] {session_id} 群友画像已更新，"
-                f"涉及 {len(traits_by_user)} 人，共 {total_written} 条特征"
+                f"[Harvester] 话题 {topic_id[:8]} 提炼完成: "
+                f"LLM 返回 {len(entries)} 条, 有效 {len(valid)} 条"
+            )
+            return valid
+
+    except json.JSONDecodeError as e:
+        logger.error(
+            f"[Harvester] 话题 {topic_id[:8]} JSON 解析失败: {e}\n"
+            f"原始输出: {raw[:500] if raw else 'N/A'}"
+        )
+    except Exception as e:
+        logger.error(f"[Harvester] 话题 {topic_id[:8]} 提炼异常: {e}", exc_info=True)
+
+    return []
+
+
+async def _archive_topic(topic_id: str, session_id: str, repo) -> None:
+    """安全归档单个话题（受信号量限流），并行提炼设定 + 写草稿 + 通知管理员"""
+    async with _ARCHIVE_SEMAPHORE:
+        try:
+            # 1. 拉取话题全量消息
+            messages = await repo.get_messages_by_topic(topic_id)
+            if not messages:
+                await repo.update_topic_status(topic_id, "ARCHIVED", summary="(空话题)")
+                logger.info(f"[Harvester] 空话题 {topic_id[:8]} 已直接归档")
+                return
+
+            # 2. 并行：摘要 + 设定提炼
+            summary_result, lore_entries = await asyncio.gather(
+                _generate_topic_summary(topic_id, messages),
+                _extract_lore_from_topic(topic_id, messages, session_id),
+                return_exceptions=True,
             )
 
-        # 8b. 持久化：实体
-        entities_raw = arguments.get("entities", [])
-        if entities_raw:
-            entities_to_upsert = []
-            for ent in entities_raw:
-                eid = str(ent.get("entity_id", "")).strip()
-                name = str(ent.get("name", "")).strip()
-                etype = str(ent.get("type", "")).strip()
-                if eid and name and etype:
-                    entities_to_upsert.append({
-                        "entity_id": eid,
-                        "session_id": session_id,
-                        "name": name,
-                        "type": etype,
-                        "attributes": ent.get("attributes", {}),
-                    })
-            if entities_to_upsert:
-                count = await self.repo.upsert_entities(entities_to_upsert)
-                logger.info(f"[MemoryService] {session_id} 实体已更新，共 {count} 个")
+            # 3. 处理摘要（异常降级）
+            if isinstance(summary_result, Exception):
+                logger.warning(f"[Harvester] 话题 {topic_id[:8]} 摘要异常: {summary_result}")
+                summary = f"(摘要生成失败，话题包含 {len(messages)} 条消息)"
+            else:
+                summary = summary_result or f"(摘要生成失败，话题包含 {len(messages)} 条消息)"
 
-        # 8c. 持久化：关系
-        relations_raw = arguments.get("relations", [])
-        if relations_raw:
-            relations_to_upsert = []
-            for rel in relations_raw:
-                subj = str(rel.get("subject_entity", "")).strip()
-                pred = str(rel.get("predicate", "")).strip()
-                obj = str(rel.get("object_entity", "")).strip()
-                conf = float(rel.get("confidence", 0.5))
-                evidence = rel.get("evidence_msg_ids", [])
-                if subj and pred and obj:
-                    relations_to_upsert.append({
-                        "session_id": session_id,
-                        "subject_entity": subj,
-                        "predicate": pred,
-                        "object_entity": obj,
-                        "confidence": conf,
-                        "evidence_msg_ids": evidence if isinstance(evidence, list) else [],
-                    })
-            if relations_to_upsert:
-                count = await self.repo.upsert_relations(relations_to_upsert)
-                logger.info(f"[MemoryService] {session_id} 关系已更新，共 {count} 条")
+            # 4. 处理设定提炼（异常静默吞掉，绝不阻塞归档）
+            if isinstance(lore_entries, Exception):
+                logger.error(f"[Harvester] 话题 {topic_id[:8]} 设定提炼异常: {lore_entries}", exc_info=lore_entries)
+            elif lore_entries:
+                logger.info(f"[Harvester] 话题 {topic_id[:8]} 提炼出 {len(lore_entries)} 条设定: {[e.get('key',[]) for e in lore_entries]}")
+            else:
+                logger.info(f"[Harvester] 话题 {topic_id[:8]} 未提炼出设定（空结果）")
 
-        # 9. 移动游标：标记已总结
-        marked = await self.repo.mark_messages_summarized(message_ids)
-        logger.info(f"[MemoryService] {session_id} 已标记 {marked} 条消息为已总结")
+            if lore_entries and not isinstance(lore_entries, Exception):
+                # 写入草稿箱
+                from .world_book import DraftWorldBook
+                draft_wb = DraftWorldBook(str(DRAFT_WORLDBOOK_PATH))
+                for entry in lore_entries:
+                    entry["custom_scope"] = session_id
+                    await draft_wb.append_entry(entry)
+
+                # 通知管理员（带重试，Bot 实例可能尚未就绪）
+                keys_str = ", ".join(k for e in lore_entries for k in e.get("key", []))
+                content_preview = lore_entries[0].get("content", "")[:80]
+                notify_msg = (
+                    f"[Worldbook Auto-Lore]\n"
+                    f"已从 {session_id} 的对话中提炼出 {len(lore_entries)} 条新设定草稿：\n"
+                    f"关键词：{keys_str}\n"
+                    f"内容：{content_preview}...\n"
+                    f"请前往 Web 控制台「世界书」标签审核。"
+                )
+                superusers = list(plugin_config.superusers)
+                if not superusers:
+                    logger.warning("[Harvester] 无 superusers 配置，跳过通知")
+                else:
+                    bot = None
+                    for attempt in range(3):
+                        try:
+                            from nonebot import get_bot
+                            bot = get_bot()
+                            break
+                        except Exception as e:
+                            logger.warning(f"[Harvester] 获取 Bot 实例失败 (attempt {attempt+1}/3): {e}")
+                            await asyncio.sleep(5)
+                    if bot:
+                        for uid in superusers:
+                            try:
+                                await bot.send_private_msg(user_id=int(uid), message=notify_msg)
+                                logger.info(f"[Harvester] 已通知管理员 {uid}")
+                            except Exception as e:
+                                logger.warning(f"[Harvester] 通知管理员 {uid} 失败: {e}")
+                    else:
+                        logger.error("[Harvester] 3 次获取 Bot 实例均失败，管理员通知未发送")
+
+            # 5. 更新话题状态
+            await repo.update_topic_status(topic_id, "ARCHIVED", summary=summary)
+            logger.info(f"[Harvester] 话题 {topic_id[:8]} 已归档，摘要: {summary[:60]}...")
+
+        except Exception as e:
+            logger.error(f"[Harvester] 话题 {topic_id[:8]} 归档失败: {e}")
+        finally:
+            await asyncio.sleep(_ARCHIVE_COOLDOWN)
+
+
+async def topic_harvester_daemon(repo) -> None:
+    """
+    话题收割机守护进程。
+
+    - 每 60 秒扫描一次 ACTIVE 话题池
+    - 将超过 10 分钟无活动的 ACTIVE 话题移入 SUSPENDED
+    - 将超过 30 分钟的 SUSPENDED 话题归档（调用 LLM 生成摘要）
+    """
+    from .topic_router import ACTIVE_TOPICS_POOL
+
+    logger.info("[Harvester] 话题收割机守护进程已启动")
+    await asyncio.sleep(30)  # 启动后等待 30 秒，让系统先稳定
+
+    while True:
+        try:
+            await asyncio.sleep(HARVESTER_SCAN_INTERVAL)
+            now = time.time()
+
+            suspended_this_round = 0
+            archived_count = 0
+
+            # ── 阶段 1：ACTIVE → SUSPENDED（内存池扫描）──
+            for session_id, pool in list(ACTIVE_TOPICS_POOL.items()):
+                expired = []
+                for topic in pool:
+                    if now - topic.last_active > TOPIC_ACTIVE_TIMEOUT:
+                        expired.append(topic)
+
+                for topic in expired:
+                    # 从内存池移除
+                    pool.remove(topic)
+                    # 更新数据库状态
+                    await repo.upsert_topic_thread(
+                        topic_id=topic.topic_id,
+                        session_id=session_id,
+                        status="SUSPENDED",
+                    )
+                    suspended_this_round += 1
+                    logger.info(f"[Harvester] 话题 {topic.topic_id[:8]} 已挂起 (session={session_id})")
+
+                # 清理空池
+                if not pool:
+                    del ACTIVE_TOPICS_POOL[session_id]
+
+            # ── 阶段 2：SUSPENDED → ARCHIVED（数据库扫描）──
+            suspended_topics = await repo.get_suspended_topics(stale_seconds=TOPIC_ARCHIVE_TIMEOUT)
+
+            if suspended_topics:
+                archive_tasks = []
+                for topic_info in suspended_topics:
+                    tid = topic_info["topic_id"]
+                    sid = topic_info["session_id"]
+                    archive_tasks.append(
+                        asyncio.create_task(_archive_topic(tid, sid, repo))
+                    )
+
+                # 批量等待本轮归档任务
+                if archive_tasks:
+                    await asyncio.gather(*archive_tasks, return_exceptions=True)
+                    archived_count = len(archive_tasks)
+                    logger.info(f"[Harvester] 本轮归档完成，共处理 {archived_count} 个话题")
+
+            # ── 本轮扫描汇总 ──
+            active_pool_count = sum(len(p) for p in ACTIVE_TOPICS_POOL.values())
+            logger.info(
+                f"[Harvester] 本轮扫描汇总: 活跃话题池={active_pool_count}, "
+                f"本次挂起={suspended_this_round}, 归档={archived_count}"
+            )
+
+        except Exception as e:
+            logger.error(f"[Harvester] 收割机异常: {e}")
+            await asyncio.sleep(10)  # 异常后短暂等待再重试

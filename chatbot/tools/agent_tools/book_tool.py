@@ -83,7 +83,7 @@ class JmDownloadTool(BaseTool):
         if not context.get("allow_r18"):
             return "❌ 本群未开启 R18 访问权限，已拦截此操作。", []
 
-        ids = arguments.get("ids", [])
+        ids = arguments.get("ids") or []
         if not ids:
             return "请提供要下载的本子ID", []
 
@@ -100,6 +100,6 @@ class JmDownloadTool(BaseTool):
         target_id = int(group_id) if is_group else int(user_id)
         message_type = "group" if is_group else "private"
 
-        # 调用书籍服务执行下载与发送
-        result_msg = await book_srv.handle_jm_download(bot, target_id, message_type, ids)
+        # 异步解耦入口：立即返回，后台下载完成后自动发送
+        result_msg = await book_srv.enqueue_jm_download(bot, target_id, message_type, ids, user_id)
         return result_msg, []

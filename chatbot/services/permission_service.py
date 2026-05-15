@@ -130,7 +130,7 @@ class PermissionService:
         """拉取群历史消息。当前依赖 go-cqhttp 扩展 API 'get_group_msg_history'。"""
         try:
             history = await bot.call_api("get_group_msg_history", group_id=group_id)
-            return history.get("messages", [])
+            return history.get("messages") or []
         except Exception as e:
             logger.warning(f"[Audit] Fetch history failed: {e}")
             raise
@@ -212,9 +212,9 @@ class PermissionService:
                     logger.error(f"Audit API error {resp.status_code}: {resp.text}")
                     return ""
                 data = resp.json()
-                choices = data.get("choices", [])
+                choices = data.get("choices") or []
                 if choices:
-                    return choices[0].get("message", {}).get("content", "")
+                    return (choices[0].get("message") or {}).get("content", "")
         except Exception as e:
             logger.error(f"Audit LLM call failed: {e}")
         return ""

@@ -2,7 +2,7 @@
 from .image_tool import GenerateImageTool, SearchAcgImageTool
 from .book_tool import RecommendBookTool, JmDownloadTool
 from .rule_tool import LearnRuleTool, ForgetRuleTool
-from .system_tool import MarkTaskCompleteTool
+from .system_tool import MarkTaskCompleteTool, ExitSessionTool, NoOpTool
 
 __all__ = [
     "GenerateImageTool",
@@ -12,4 +12,6 @@ __all__ = [
     "LearnRuleTool",
     "ForgetRuleTool",
     "MarkTaskCompleteTool",
+    "ExitSessionTool",
+    "NoOpTool",
 ]

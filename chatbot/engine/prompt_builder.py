@@ -617,11 +617,25 @@ class PromptPipeline:
         if extra_blocks:
             blocks.extend(extra_blocks)
 
-        # Step 3: Run token arbitration
-        trimmed_blocks, trimmed_history = self._arbitrator.apply_budget(blocks, history)
+        # Step 3: Run token arbitration (with graceful degradation on failure)
+        from .token_budget import TokenBudgetExceeded
+        truncation_notice: ChatMessage | None = None
+        try:
+            trimmed_blocks, trimmed_history = self._arbitrator.apply_budget(blocks, history)
+        except TokenBudgetExceeded as exc:
+            # Graceful degradation: use the best-effort result from the exception
+            # and inject a system notice about truncation
+            trimmed_blocks = exc.remaining_blocks
+            trimmed_history = exc.remaining_history
+            truncation_notice = ChatMessage(
+                role=MessageRole.SYSTEM,
+                content="[系统通知] 上下文过长，已自动截断早期内容。",
+            )
 
         # Step 4: Convert blocks + history to final ChatMessage list
         messages: list[ChatMessage] = []
+        if truncation_notice is not None:
+            messages.append(truncation_notice)
         for block in trimmed_blocks:
             content = block.total_content()
             if content:

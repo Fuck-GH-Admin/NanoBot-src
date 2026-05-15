@@ -117,7 +117,7 @@ class LearnRuleTool(BaseTool):
             )
 
         # 2. 校验 & 规范化 keywords
-        raw_keywords: list[str] = arguments.get("keywords", [])
+        raw_keywords: list[str] = arguments.get("keywords") or []
         if not raw_keywords or not isinstance(raw_keywords, list):
             return "错误：keywords 不能为空。", []
 
@@ -241,7 +241,7 @@ class ForgetRuleTool(BaseTool):
         active_rules = await repo.get_active_rules(scope_type, scope_id)
         matched_ids = []
         for rule in active_rules:
-            if query in rule.get("keywords", []):
+            if query in (rule.get("keywords") or []):
                 matched_ids.append(rule["rule_id"])
 
         if not matched_ids:

@@ -6,10 +6,12 @@ import time
 import uuid
 import httpx
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, Optional
 from nonebot.log import logger
 
 from ..config import plugin_config
+from ..utils.path_utils import WORLDBOOK_PATH
 from .prompt_adapter import PromptAdapter
 from .rule_engine import RuleEngine, RuleEngineCore, SQLiteRuleProvider
 from ..repositories.memory_repo import MemoryRepository
@@ -19,9 +21,10 @@ from ..tools.agent_tools import (
     GenerateImageTool, SearchAcgImageTool,
     RecommendBookTool, JmDownloadTool,
     LearnRuleTool, ForgetRuleTool,
-    MarkTaskCompleteTool,
+    MarkTaskCompleteTool, ExitSessionTool, NoOpTool,
 )
 from .memory_service import MemoryService
+from .world_book import WorldBook
 from ..utils.embedding import create_semantic_lorebook
 from ..utils.alert_manager import send_emergency_alert, reset_cooldown
 from ..utils.session_dumper import SessionDumper
@@ -65,6 +68,9 @@ class AgentService:
         self.registry = AgentToolRegistry()
         self.http_client = httpx.AsyncClient()
         self.semantic_lorebook = create_semantic_lorebook(plugin_config)
+        self.world_book = WorldBook(
+            str(WORLDBOOK_PATH)
+        )
         self.rule_engine = RuleEngine(SQLiteRuleProvider())
         self.rule_repo = RuleRepository()
         self._register_tools()
@@ -78,6 +84,8 @@ class AgentService:
         self.registry.register(ForgetRuleTool())
         if plugin_config.enable_dynamic_loop:
             self.registry.register(MarkTaskCompleteTool())
+        self.registry.register(ExitSessionTool())
+        self.registry.register(NoOpTool())
 
     async def close(self):
         await self.http_client.aclose()
@@ -114,6 +122,14 @@ class AgentService:
             api_payload["thinking"] = {"type": "disabled"}
         if tools:
             api_payload["tools"] = tools
+            api_payload["tool_choice"] = "required"
+
+        # 脱敏：替换 API Key
+        _safe_payload = json.dumps(api_payload, ensure_ascii=False, default=str)
+        _safe_key = plugin_config.deepseek_api_key
+        if _safe_key:
+            _safe_payload = _safe_payload.replace(_safe_key, "***REDACTED***")
+        logger.info(f"[Agent] LLM 请求体: {_safe_payload}")
 
         try:
             resp = await self.http_client.post(
@@ -133,15 +149,16 @@ class AgentService:
                     ))
                 return None
             data = resp.json()
+            logger.info(f"[Agent] LLM 响应体: {json.dumps(data, ensure_ascii=False, default=str)}")
             reset_cooldown()
         except Exception as e:
             logger.error(f"[Agent] 请求 LLM 失败: {e}")
             return None
 
-        choices = data.get("choices", [])
+        choices = data.get("choices") or []
         if not choices:
             return None
-        return choices[0].get("message", {})
+        return choices[0].get("message") or {}
 
     @staticmethod
     def _build_session_id(group_id: int, user_id: str) -> str:
@@ -178,37 +195,6 @@ class AgentService:
 
         return result
 
-    def _build_memory_snapshot(
-        self,
-        existing_summary: str,
-        profiles_raw: Dict,
-        decayed_relations: list,
-    ) -> Dict[str, Any]:
-        """从数据库原始数据构建 memorySnapshot 字典。"""
-        return {
-            "summary": existing_summary,
-            "profiles": [
-                {
-                    "user_id": uid,
-                    "traits": [
-                        {"content": t["content"], "confidence": t.get("confidence", 0.5)}
-                        for t in traits
-                    ]
-                }
-                for uid, traits in profiles_raw.items()
-            ],
-            "relations": [
-                {
-                    "relation_id": r["relation_id"],
-                    "subject_entity": r["subject_entity"],
-                    "predicate": r["predicate"],
-                    "object_entity": r["object_entity"],
-                    "confidence": r["decayed_confidence"],
-                }
-                for r in decayed_relations
-            ],
-        }
-
     def _build_safe_history(self, messages: list) -> list:
         """构建安全的聊天历史，过滤掉工具调用相关的消息。"""
         safe = []
@@ -222,6 +208,79 @@ class AgentService:
             safe.append(clean)
         return safe
 
+    @staticmethod
+    def _parse_pb_close_session(raw_text: str) -> tuple[str, bool]:
+        """
+        解析人格脑输出中的 close_session 元数据标志。
+
+        PB 输出格式约定：正文中可包含如下 JSON 代码块：
+            ```session_ctl
+            {"close_session": true}
+            ```
+
+        返回 (清理后的文本, close_session 标志)。
+        """
+        import re
+        close_session = False
+        clean_text = raw_text
+
+        # 匹配 ```session_ctl ... ``` 代码块
+        pattern = re.compile(r'```session_ctl\s*\n?\s*(\{.*?\})\s*\n?\s*```', re.DOTALL)
+        match = pattern.search(raw_text)
+        if match:
+            try:
+                ctl = json.loads(match.group(1))
+                close_session = bool(ctl.get("close_session", False))
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # 从输出文本中移除控制块
+            clean_text = pattern.sub('', raw_text).strip()
+
+        return clean_text, close_session
+
+    @staticmethod
+    def _build_logic_history(messages: list, max_tokens: int = 4000) -> list:
+        """
+        为逻辑脑构建纯净历史（话题级全量 + XML 封印 + Token 预算截断）。
+
+        - user / tool_calls / tool → 原样保留
+        - 纯文本 assistant → 用 <actor_past_reply> 封印，防止 RP 污染
+        - 逆向遍历，优先保留最新上下文，达到 Token 阈值后停止
+        """
+        from ..engine.token_budget import estimate_tokens
+
+        result = []
+        current_tokens = 0
+
+        for msg in reversed(messages):
+            role = msg.get("role")
+            safe_msg = None
+
+            if role == "user":
+                safe_msg = msg
+            elif role == "assistant" and msg.get("tool_calls"):
+                safe_msg = msg
+            elif role == "tool":
+                safe_msg = msg
+            elif role == "assistant" and msg.get("content"):
+                # 封印 RP 文本：让逻辑脑知道 Bot 说过什么，但不会被语气污染
+                safe_msg = msg.copy()
+                safe_msg["content"] = (
+                    f"<actor_past_reply>\n{msg['content']}\n</actor_past_reply>"
+                )
+
+            if safe_msg:
+                msg_text = str(safe_msg.get("content", "")) + str(safe_msg.get("tool_calls", ""))
+                tokens = estimate_tokens(msg_text)
+                if current_tokens + tokens > max_tokens:
+                    break
+                result.append(safe_msg)
+                current_tokens += tokens
+
+        # 翻转回正序
+        result.reverse()
+        return result
+
     async def _run_actor_only(
         self,
         user_id: str,
@@ -230,6 +289,7 @@ class AgentService:
         safe_history: list,
         snapshot: Dict[str, Any],
         system_notification: str = "",
+        worldbook_entries: str = "",
     ) -> Dict[str, Any]:
         """仅演员脑渲染：编译 prompt → LLM（无 tools）→ 返回文本。"""
         lorebook_context = {
@@ -244,6 +304,7 @@ class AgentService:
             snapshot=snapshot,
             context=lorebook_context,
             system_notification=system_notification,
+            worldbook_entries=worldbook_entries,
         )
         msg = await self._call_llm(compiled_messages, tools=None, temperature=0.7)
         if msg is None:
@@ -329,7 +390,7 @@ class AgentService:
     @staticmethod
     def _build_prefix_args(tool_name: str, remainder: str, tool_obj) -> dict:
         """根据工具 schema 和前缀后的剩余文本构建参数。"""
-        params = tool_obj.parameters.get("properties", {})
+        params = (tool_obj.parameters.get("properties") or {})
 
         if tool_name == "jm_download" and remainder:
             ids = [x.strip() for x in remainder.replace(",", " ").split() if x.strip()]
@@ -382,20 +443,15 @@ class AgentService:
             except asyncio.TimeoutError:
                 msgs = []
 
-            safe_history = [m for m in (self._to_openai_message(x) for x in msgs) if m is not None]
-            # 不再向 safe_history 追加伪 user 消息，改为通过 system_notification 传递
+            safe_history = []  # 系统级事件隔离群聊历史，防止被历史上下文污染
 
-            # 读取已有记忆，但不写入
-            try:
-                snapshot = await asyncio.wait_for(
-                    self.repo.get_memory_snapshot(session_id),
-                    timeout=DB_QUERY_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                snapshot = {"summary": "", "profiles": [], "relations": []}
+            # 旧的 memorySnapshot 注入已废弃
+            snapshot = {}
+            wb_content = self.world_book.search(text, group_id)
             result = await self._run_actor_only(
                 user_id, text, context, safe_history, snapshot,
                 system_notification=text,
+                worldbook_entries=wb_content,
             )
             latency = round((time.time() - start_time) * 1000, 2)
             asyncio.create_task(SessionDumper.dump(
@@ -419,70 +475,64 @@ class AgentService:
         await self.rule_engine.match(text, context)
         context["_agent_state"]["step"] = "matched"
 
+        topic_id = context.get("topic_id")
+
         sender_name = context.get("sender_name", "User")
         now_iso = datetime.now().isoformat()
+        user_fingerprint = context.get("message_fingerprint")
         await self.repo.add_message(
             session_id=session_id,
             role="user",
             content=text,
+            topic_id=topic_id,
             user_id=user_id,
             name=sender_name,
             timestamp=now_iso,
+            message_fingerprint=user_fingerprint,
         )
 
-        # ---- 3. 读取近期消息（此时包含刚写入的用户消息） ----
-        try:
-            recent_msgs = await asyncio.wait_for(
-                self.repo.get_recent_messages(session_id, limit=RECENT_MESSAGES_LIMIT),
-                timeout=DB_QUERY_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"[Agent] 获取最近消息超时（{DB_QUERY_TIMEOUT}s），降级为空历史")
-            recent_msgs = []
-
-        messages = [m for m in (self._to_openai_message(x) for x in recent_msgs) if m is not None]
-
-        # 活跃画像
-        try:
-            active_uids = list({m.get("user_id") for m in recent_msgs if m.get("user_id")})
-            profiles_raw = await asyncio.wait_for(
-                self.repo.get_active_profiles(session_id, active_uids),
-                timeout=DB_QUERY_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[Agent] 获取活跃画像超时，降级为空画像")
-            profiles_raw = {}
-            active_uids = []
-
-        # 群组摘要
-        try:
-            existing_summary = await asyncio.wait_for(
-                self.repo.get_group_summary(session_id),
-                timeout=DB_QUERY_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[Agent] 获取群组摘要超时，降级为空摘要")
-            existing_summary = ""
-
-        # 关系图谱
-        decayed_relations = []
-        if plugin_config.entity_relation_enabled:
+        # ---- 3. 读取消息（话题级精准查询 or 全局回退） ----
+        if topic_id:
             try:
-                entity_ids = [f"user_{uid}" for uid in active_uids if uid]
-                decayed_relations = await asyncio.wait_for(
-                    self.repo.get_relations_with_decay(
-                        session_id, entity_ids=entity_ids if entity_ids else None
-                    ),
+                recent_msgs = await asyncio.wait_for(
+                    self.repo.get_messages_by_topic(topic_id),
+                    timeout=DB_QUERY_TIMEOUT,
+                )
+                # 话题内消息过多时截断，防止 OOM
+                if len(recent_msgs) > 50:
+                    recent_msgs = recent_msgs[-50:]
+            except asyncio.TimeoutError:
+                logger.error(f"[Agent] 话题 {topic_id} 消息查询超时，降级为空历史")
+                recent_msgs = []
+        else:
+            # 私聊或无话题 ID 时回退到全局查询
+            try:
+                recent_msgs = await asyncio.wait_for(
+                    self.repo.get_recent_messages(session_id, limit=RECENT_MESSAGES_LIMIT),
                     timeout=DB_QUERY_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.error("[Agent] 获取关系图谱超时，降级为空关系")
-                decayed_relations = []
+                logger.error(f"[Agent] 获取最近消息超时（{DB_QUERY_TIMEOUT}s），降级为空历史")
+                recent_msgs = []
+
+        messages = [m for m in (self._to_openai_message(x) for x in recent_msgs) if m is not None]
+
+        active_uids = list({m.get("user_id") for m in recent_msgs if m.get("user_id")})
 
         # 工具 schema
         perm_srv = context.get("permission_service")
         is_admin = context.get("is_admin", False)
         tools = self.registry.get_all_schemas(perm_srv, user_id, is_admin)
+
+        # 显式触发时，从工具列表中移除 exit_session（防止逻辑脑误判退出）
+        if context.get("is_tome") or context.get("is_reply_bot") or context.get("has_wake_word"):
+            tools = [t for t in tools if t["function"]["name"] != "exit_session"]
+
+        logger.info(
+            f"[Agent] 逻辑脑上下文: is_tome={context.get('is_tome')}, "
+            f"is_reply_bot={context.get('is_reply_bot')}, has_wake_word={context.get('has_wake_word')}, "
+            f"tools_count={len(tools)}, tools={[t['function']['name'] for t in tools]}"
+        )
 
         # 语义检索
         semantic_hits = []
@@ -496,7 +546,11 @@ class AgentService:
                 logger.warning(f"[Agent] 语义检索失败，降级为纯关键词: {e}")
                 semantic_hits = []
 
-        snapshot = self._build_memory_snapshot(existing_summary, profiles_raw, decayed_relations)
+        # 旧的 memorySnapshot 注入已废弃（group_memory/group_dynamics 不再注入 Actor Prompt）
+        snapshot = {}
+
+        # 世界书关键词检索（供演员脑注入）
+        wb_content = self.world_book.search(text, group_id)
 
         # 构建安全历史（剔除 tool 相关）供逻辑脑使用
         safe_history = self._build_safe_history(messages)
@@ -515,6 +569,7 @@ class AgentService:
                 snapshot=snapshot,
                 context=actor_lorebook_context,
                 system_notification=forced_result["system_notification"],
+                worldbook_entries=wb_content,
             )
             final_msg = await self._call_llm(
                 actor_msgs, tools=None, model=plugin_config.deepseek_model_name, temperature=0.7,
@@ -525,14 +580,10 @@ class AgentService:
                 session_id=session_id,
                 role="assistant",
                 content=final_text,
+                topic_id=topic_id,
                 timestamp=datetime.now().isoformat(),
+                message_fingerprint=uuid.uuid4().hex,
             )
-
-            from .. import circuit_breaker
-            if circuit_breaker is None or circuit_breaker.allow_new_task():
-                asyncio.create_task(
-                    self.memory_service.process_session_memory(session_id)
-                )
 
             latency = round((time.time() - start_time) * 1000, 2)
             asyncio.create_task(SessionDumper.dump(
@@ -541,7 +592,7 @@ class AgentService:
                 payload={
                     "input_text": text,
                     "agent_state": "forced_actor",
-                    "matched_rule": context.get("_matched_rule", {}).get("rule_name"),
+                    "matched_rule": (context.get("_matched_rule") or {}).get("rule_name"),
                     "tool_logs": [forced_result["system_notification"][:200]],
                     "output_text": final_text,
                     "has_images": bool(forced_result["images"]),
@@ -552,12 +603,16 @@ class AgentService:
 
         # ---- 4. Phase 1：逻辑循环 ----
         context["_agent_state"]["step"] = "executing"
-        logic_history = safe_history[-LOGIC_HISTORY_LIMIT:]
+        # 防线 1：纯净历史 — 话题级全量 + XML 封印 + Token 预算截断
+        logic_history = self._build_logic_history(messages)
         lorebook_context = {
             "group_id": group_id,
             "active_uids": active_uids,
             "token_arbitration_enabled": plugin_config.token_arbitration_enabled,
             "_matched_rule": context.get("_matched_rule"),
+            "is_tome": context.get("is_tome"),
+            "is_reply_bot": context.get("is_reply_bot"),
+            "has_wake_word": context.get("has_wake_word"),
         }
         if semantic_hits:
             lorebook_context["semantic_hits"] = semantic_hits
@@ -578,22 +633,44 @@ class AgentService:
         request_id = uuid.uuid4().hex
         step_counter = 0
 
+        # 初始化请求级防重放计数器
+        self.registry.begin_request(request_id)
+        context["request_id"] = request_id
+
+        # 逻辑脑 exit_session 短路标志
+        lb_exit_session = False
+
         for loop_count in range(max_loops):
+            logger.info(f"[Agent] 逻辑脑调用: model={logic_model}, tools_count={len(tools) if tools else 0}")
             msg = await self._call_llm(
                 logic_msgs, tools=tools, model=logic_model, temperature=0.0,
             )
             if msg is None:
                 break
-
-            tcs = msg.get("tool_calls", [])
+            logger.info(f"[Agent] 逻辑脑返回: {json.dumps(msg, ensure_ascii=False)}")
+            tcs = msg.get("tool_calls") or []
             if not tcs:
+                # 防线 3：非法输出拦截 — 逻辑脑"入戏"了，纠正并重试
+                leaked_content = msg.get("content", "")
+                if leaked_content.strip():
+                    logger.warning(
+                        f"[Agent] 逻辑脑违规输出自然语言，触发纠正: {leaked_content[:80]}..."
+                    )
+                    logic_msgs.append({
+                        "role": "system",
+                        "content": (
+                            "[系统纠正] 你是纯逻辑调度模块，禁止输出自然语言或角色扮演。"
+                            "请立即输出 tool_calls JSON，或输出空 content 表示无需调用工具。"
+                        ),
+                    })
+                    continue
                 break
 
             # 去重：计算签名，若全部已执行则终止
             new_tcs = []
             for tc in tcs:
-                func_name = tc.get("function", {}).get("name", "")
-                args_str = tc.get("function", {}).get("arguments", "{}")
+                func_name = (tc.get("function") or {}).get("name", "")
+                args_str = (tc.get("function") or {}).get("arguments", "{}")
                 try:
                     args_obj = json.loads(args_str) if isinstance(args_str, str) else args_str
                     normalized_args = json.dumps(args_obj, sort_keys=True, ensure_ascii=False)
@@ -608,19 +685,19 @@ class AgentService:
                 logger.info(f"[Agent] {session_id} 逻辑循环：所有工具调用已重复，退出")
                 break
 
-            # 追加 assistant 消息（含全部 tool_calls）到 logic_msgs（仅内存，不写 DB）
+            # 追加 assistant 消息（仅含去重后的 tool_calls）到 logic_msgs（仅内存，不写 DB）
             assistant_content = msg.get("content", "")
             logic_msgs.append({
                 "role": "assistant",
                 "content": assistant_content,
-                "tool_calls": tcs,
+                "tool_calls": new_tcs,
             })
 
-            # 遍历执行工具
-            for tc in tcs:
+            # 遍历执行去重后的工具
+            for tc in new_tcs:
                 tool_id = tc.get("id", "")
-                func_name = tc.get("function", {}).get("name", "")
-                arguments_str = tc.get("function", {}).get("arguments", "{}")
+                func_name = (tc.get("function") or {}).get("name", "")
+                arguments_str = (tc.get("function") or {}).get("arguments", "{}")
                 try:
                     arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
                 except json.JSONDecodeError:
@@ -641,6 +718,11 @@ class AgentService:
                     images = []
 
                 all_images.extend(images)
+
+                # 检测逻辑脑 exit_session 短路信号
+                if func_name == "exit_session":
+                    lb_exit_session = True
+                    logger.info(f"[Agent] 逻辑脑调用 exit_session，将跳过人格脑渲染")
 
                 # 记录日志（截断）
                 log_entry = f"[{func_name}] {result_text[:TOOL_RESULT_MAX_LEN]}"
@@ -680,6 +762,28 @@ class AgentService:
                         ),
                     })
 
+        # 清理请求级防重放计数器
+        self.registry.end_request(request_id)
+
+        # ---- 4.5. 逻辑脑 exit_session 短路：跳过人格脑，静默退出 ----
+        if lb_exit_session:
+            logger.info(f"[Agent] {session_id} 逻辑脑已执行 exit_session，跳过人格脑渲染，静默退出")
+            latency = round((time.time() - start_time) * 1000, 2)
+            asyncio.create_task(SessionDumper.dump(
+                group_id=str(group_id),
+                user_id=user_id,
+                payload={
+                    "input_text": text,
+                    "agent_state": "lb_exit_session",
+                    "matched_rule": (context.get("_matched_rule") or {}).get("rule_name"),
+                    "tool_logs": tool_execution_logs,
+                    "output_text": "",
+                    "has_images": False,
+                    "latency_ms": latency,
+                },
+            ))
+            return {"text": "", "images": []}
+
         # ---- 5. Phase 2：人格渲染 ----
         context["_agent_state"]["step"] = "actor"
         if tool_execution_logs:
@@ -699,6 +803,7 @@ class AgentService:
             snapshot=snapshot,
             context=actor_lorebook_context,
             system_notification=system_notification,
+            worldbook_entries=wb_content,
         )
         final_msg = await self._call_llm(
             actor_msgs, tools=None, model=plugin_config.deepseek_model_name, temperature=0.7,
@@ -712,12 +817,26 @@ class AgentService:
             )
             final_text = last_assistant.get("content", "") if last_assistant else "任务完成。"
 
+        # ---- 5.5. 解析人格脑 close_session 元数据标志 ----
+        final_text, pb_close_session = self._parse_pb_close_session(final_text)
+        if pb_close_session:
+            logger.info(f"[Agent] {session_id} 人格脑输出 close_session=true，异步销毁沉浸会话")
+            _active_sessions = context.get("_active_sessions")
+            if _active_sessions and group_id:
+                group_topics = _active_sessions.get(group_id, {})
+                for tid, users in group_topics.items():
+                    if user_id in users:
+                        del users[user_id]
+                        break
+
         # 持久化最终 assistant 回复（不含 tool_calls）
         await self.repo.add_message(
             session_id=session_id,
             role="assistant",
             content=final_text,
+            topic_id=topic_id,
             timestamp=datetime.now().isoformat(),
+            message_fingerprint=uuid.uuid4().hex,
         )
 
         # 命中统计
@@ -728,23 +847,14 @@ class AgentService:
             except Exception as e:
                 logger.warning(f"[Agent] 更新命中统计失败: {e}")
 
-        # 记忆压缩（熔断器保护）
-        from .. import circuit_breaker
-        if circuit_breaker is None or circuit_breaker.allow_new_task():
-            asyncio.create_task(
-                self.memory_service.process_session_memory(session_id)
-            )
-        else:
-            logger.debug("[Agent] 记忆压缩熔断中，跳过入队")
-
         latency = round((time.time() - start_time) * 1000, 2)
         asyncio.create_task(SessionDumper.dump(
             group_id=str(group_id),
             user_id=user_id,
             payload={
                 "input_text": text,
-                "agent_state": context.get("_agent_state", {}).get("step", "unknown"),
-                "matched_rule": context.get("_matched_rule", {}).get("rule_name"),
+                "agent_state": (context.get("_agent_state") or {}).get("step", "unknown"),
+                "matched_rule": (context.get("_matched_rule") or {}).get("rule_name"),
                 "tool_logs": tool_execution_logs,
                 "output_text": final_text,
                 "has_images": bool(all_images),
@@ -773,71 +883,55 @@ class AgentService:
         # ---------- 3. 第一时间落库：记录 User 消息 ----------
         sender_name = context.get("sender_name", "User")
         now_iso = datetime.now().isoformat()
+        topic_id = context.get("topic_id")
 
         await self.repo.add_message(
             session_id=session_id,
             role="user",
             content=text,
+            topic_id=topic_id,
             user_id=user_id,
             name=sender_name,
             timestamp=now_iso,
+            message_fingerprint=context.get("message_fingerprint"),
         )
 
         # ---------- 3. 精准备料（含超时降级） ----------
-        # 3a. 最近消息
-        try:
-            recent_msgs = await asyncio.wait_for(
-                self.repo.get_recent_messages(session_id, limit=RECENT_MESSAGES_LIMIT),
-                timeout=DB_QUERY_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"[Agent] 获取最近消息超时（{DB_QUERY_TIMEOUT}s），降级为空历史")
-            recent_msgs = []
-        messages = [m for m in (self._to_openai_message(x) for x in recent_msgs) if m is not None]
-
-        # 3b. 活跃画像
-        try:
-            active_uids = list({
-                m.get("user_id") for m in recent_msgs if m.get("user_id")
-            })
-            profiles_raw = await asyncio.wait_for(
-                self.repo.get_active_profiles(session_id, active_uids),
-                timeout=DB_QUERY_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[Agent] 获取活跃画像超时，降级为空画像")
-            profiles_raw = {}
-            active_uids = []
-
-        # 3c. 群组摘要
-        try:
-            existing_summary = await asyncio.wait_for(
-                self.repo.get_group_summary(session_id),
-                timeout=DB_QUERY_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[Agent] 获取群组摘要超时，降级为空摘要")
-            existing_summary = ""
-
-        # 3d. 关系图谱（如果启用）
-        decayed_relations = []
-        if plugin_config.entity_relation_enabled:
+        # 3a. 消息（话题级精准查询 or 全局回退）
+        if topic_id:
             try:
-                entity_ids = [f"user_{uid}" for uid in active_uids if uid]
-                decayed_relations = await asyncio.wait_for(
-                    self.repo.get_relations_with_decay(
-                        session_id, entity_ids=entity_ids if entity_ids else None
-                    ),
+                recent_msgs = await asyncio.wait_for(
+                    self.repo.get_messages_by_topic(topic_id),
+                    timeout=DB_QUERY_TIMEOUT,
+                )
+                if len(recent_msgs) > 50:
+                    recent_msgs = recent_msgs[-50:]
+            except asyncio.TimeoutError:
+                logger.error(f"[Agent] 话题 {topic_id} 消息查询超时，降级为空历史")
+                recent_msgs = []
+        else:
+            try:
+                recent_msgs = await asyncio.wait_for(
+                    self.repo.get_recent_messages(session_id, limit=RECENT_MESSAGES_LIMIT),
                     timeout=DB_QUERY_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.error("[Agent] 获取关系图谱超时，降级为空关系")
-                decayed_relations = []
+                logger.error(f"[Agent] 获取最近消息超时（{DB_QUERY_TIMEOUT}s），降级为空历史")
+                recent_msgs = []
+        messages = [m for m in (self._to_openai_message(x) for x in recent_msgs) if m is not None]
+
+        active_uids = list({
+            m.get("user_id") for m in recent_msgs if m.get("user_id")
+        })
 
         # 工具 schema
         perm_srv = context.get("permission_service")
         is_admin = context.get("is_admin", False)
         tools = self.registry.get_all_schemas(perm_srv, user_id, is_admin)
+
+        # 显式触发时，从工具列表中移除 exit_session（防止逻辑脑误判退出）
+        if context.get("is_tome") or context.get("is_reply_bot") or context.get("has_wake_word"):
+            tools = [t for t in tools if t["function"]["name"] != "exit_session"]
 
         max_loops = plugin_config.agent_max_loops
         all_images = []
@@ -882,36 +976,16 @@ class AgentService:
                     logger.warning(f"[Agent] 语义检索失败，降级为纯关键词: {e}")
                     lorebook_context["semantic_hits"] = []
 
-            # 构建 memorySnapshot
-            memory_snapshot = {
-                "summary": existing_summary,
-                "profiles": [
-                    {
-                        "user_id": uid,
-                        "traits": [
-                            {"content": t["content"], "confidence": t.get("confidence", 0.5)}
-                            for t in traits
-                        ]
-                    }
-                    for uid, traits in profiles_raw.items()
-                ],
-                "relations": [
-                    {
-                        "relation_id": r["relation_id"],
-                        "subject_entity": r["subject_entity"],
-                        "predicate": r["predicate"],
-                        "object_entity": r["object_entity"],
-                        "confidence": r["decayed_confidence"],
-                    }
-                    for r in decayed_relations
-                ],
-            }
+            # 旧的 memorySnapshot 注入已废弃
+            memory_snapshot = {}
 
             # 使用 PromptAdapter 组装 messages（engine 管线）
+            wb_content = self.world_book.search(text, group_id)
             compiled_messages = self.prompt_adapter.compile_actor_prompt(
                 chat_history=messages,
                 snapshot=memory_snapshot,
                 context=lorebook_context,
+                worldbook_entries=wb_content,
             )
 
             # 直连 LLM API
@@ -920,7 +994,7 @@ class AgentService:
                 return {"text": "大脑短路了，等一下再试吧...", "images": all_images}
 
             content = msg.get("content", "")
-            tool_calls = msg.get("tool_calls", [])
+            tool_calls = msg.get("tool_calls") or []
 
             # ── 重复检测：连续两轮高度相似则终止（需开启动态循环） ──
             if plugin_config.enable_dynamic_loop and content and last_assistant_text:
@@ -942,7 +1016,9 @@ class AgentService:
                     session_id=session_id,
                     role="assistant",
                     content=content,
+                    topic_id=topic_id,
                     timestamp=datetime.now().isoformat(),
+                    message_fingerprint=uuid.uuid4().hex,
                 )
                 break
 
@@ -957,8 +1033,8 @@ class AgentService:
             task_completed = False
             for tc in tool_calls:
                 tool_id = tc.get("id", "")
-                func_name = tc.get("function", {}).get("name", "")
-                arguments_str = tc.get("function", {}).get("arguments", "{}")
+                func_name = (tc.get("function") or {}).get("name", "")
+                arguments_str = (tc.get("function") or {}).get("arguments", "{}")
                 try:
                     arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
                 except json.JSONDecodeError:
@@ -1020,15 +1096,6 @@ class AgentService:
             except Exception as e:
                 logger.warning(f"[Agent] 更新命中统计失败: {e}")
 
-        # 触发即遗忘：后台异步记忆压缩（受熔断器保护）
-        from .. import circuit_breaker
-        if circuit_breaker is None or circuit_breaker.allow_new_task():
-            asyncio.create_task(
-                self.memory_service.process_session_memory(session_id)
-            )
-        else:
-            logger.debug("[Agent] 记忆压缩熔断中，跳过入队")
-
         latency = round((time.time() - start_time) * 1000, 2)
         asyncio.create_task(SessionDumper.dump(
             group_id=str(group_id),
@@ -1036,7 +1103,7 @@ class AgentService:
             payload={
                 "input_text": text,
                 "agent_state": "single_brain",
-                "matched_rule": context.get("_matched_rule", {}).get("rule_name"),
+                "matched_rule": (context.get("_matched_rule") or {}).get("rule_name"),
                 "tool_logs": [],
                 "output_text": final_text,
                 "has_images": bool(all_images),

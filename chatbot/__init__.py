@@ -1,7 +1,7 @@
 # src/plugins/chatbot/__init__.py
+import os
 import shutil
 import asyncio
-import threading
 from pathlib import Path
 
 from nonebot import get_driver
@@ -9,7 +9,7 @@ from nonebot.log import logger
 from nonebot.plugin import PluginMetadata
 from loguru import logger as loguru_logger
 
-from .config import Config, plugin_config, start_config_web_server
+from .config import Config, plugin_config, start_web_server, stop_web_server
 from .guardian import MemoryCircuitBreaker, EventLoopMonitor
 
 # 导入所有事件响应器
@@ -27,6 +27,33 @@ __plugin_meta__ = PluginMetadata(
 )
 
 driver = get_driver()
+
+# ==============================
+# 数据目录初始化（跨平台兼容）
+# ==============================
+_REQUIRED_DATA_DIRS = [
+    "data",
+    "data/pixiv_downloads",
+    "data/books",
+    "data/books/output",
+    "data/jm_temp",
+    "data/stealth_images",
+    "data/generated_images",
+    "data/chatbot",
+    "data/chatbot/dumps",
+    "logs",
+    "logs/groups",
+    "logs/private",
+]
+
+
+@driver.on_startup
+async def _ensure_data_dirs():
+    """启动时自动创建所有必需的数据目录，避免 Linux 首次运行因缺少目录报错。"""
+    for d in _REQUIRED_DATA_DIRS:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    logger.info("[Lifecycle] 数据目录检查完成")
+
 
 # ==============================
 # 后台任务管理
@@ -79,14 +106,46 @@ async def ttl_cleanup_loop():
 # ==============================
 @driver.on_startup
 async def _setup_log_rotation():
+    # 系统级全量日志（兜底）
     loguru_logger.add(
         "logs/chatbot.log",
         rotation="10 MB",
         retention=20,
         encoding="utf-8",
         enqueue=True,
+        filter=lambda record: "group_id" not in record["extra"] and "private_user_id" not in record["extra"],
     )
-    logger.info("[Lifecycle] 日志轮转已启用: logs/chatbot.log (10MB/10天)")
+    # 群聊日志：按 group_id + 日期分文件
+    def _group_log_sink(message):
+        record = message.record
+        gid = record["extra"]["group_id"]
+        date_str = record["time"].strftime("%Y-%m-%d")
+        filepath = f"logs/groups/{date_str}_group_{gid}.log"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(message)
+
+    loguru_logger.add(
+        _group_log_sink,
+        enqueue=True,
+        filter=lambda record: "group_id" in record["extra"],
+    )
+    # 私聊日志：按 user_id + 日期分文件
+    def _private_log_sink(message):
+        record = message.record
+        uid = record["extra"]["private_user_id"]
+        date_str = record["time"].strftime("%Y-%m-%d")
+        filepath = f"logs/private/{date_str}_private_{uid}.log"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(message)
+
+    loguru_logger.add(
+        _private_log_sink,
+        enqueue=True,
+        filter=lambda record: "private_user_id" in record["extra"],
+    )
+    logger.info("[Lifecycle] 日志轮转已启用: chatbot.log + groups/ + private/")
 
 
 # ==============================
@@ -146,12 +205,16 @@ async def _boot_services():
     # 4.5 启动沉浸会话清理协程
     asyncio.create_task(chat_entry._cleanup_sessions())
 
-    # 5. 启动 Web 配置面板（后台线程，daemon 随主进程退出）
-    threading.Thread(
-        target=start_config_web_server,
-        args=(plugin_config, 8081),
-        daemon=True,
-    ).start()
+    # 4.6 启动话题收割机守护进程
+    from .services.memory_service import topic_harvester_daemon
+    from .repositories.memory_repo import MemoryRepository
+    task = asyncio.create_task(
+        run_with_self_heal("topic_harvester", lambda: topic_harvester_daemon(MemoryRepository()))
+    )
+    _background_tasks.append(task)
+
+    # 5. 启动 Web 配置面板（FastAPI + Uvicorn，asyncio 原生）
+    await start_web_server(plugin_config, 8081)
 
     # 6. 启动 TTL 清理后台任务
     task = asyncio.create_task(run_with_self_heal("ttl_cleanup", ttl_cleanup_loop))
@@ -174,3 +237,10 @@ async def _shutdown_services():
 
     # 3. 清理 Agent HTTP 连接池
     await agent_srv.close()
+
+    # 3.5 清理话题路由器 HTTP 连接池
+    from .services.topic_router import topic_router
+    await topic_router.close()
+
+    # 3.6 关闭 Web 管理面板
+    await stop_web_server()

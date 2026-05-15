@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 
-from sqlalchemy import select, update, delete, text
+from sqlalchemy import select, update, delete, text, func
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from nonebot.log import logger
 
-from .models import Base, ChatHistory, GroupMemory, UserTrait, CompactionJournal, Entity, Relation, ToolExecutionLog
+from .models import Base, ChatHistory, GroupMemory, UserTrait, CompactionJournal, Entity, Relation, ToolExecutionLog, TopicThread
 
 
 def _utc_now_iso() -> str:
@@ -88,6 +88,14 @@ class MemoryRepository:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
+            # ── 平滑迁移：SQLite 的 create_all 不会为已存在的表加新列 ──
+            # 检查 chat_history 是否有 topic_id 列，没有则自动 ALTER TABLE
+            result = await conn.execute(text("PRAGMA table_info(chat_history)"))
+            columns = [row[1] for row in result.fetchall()]
+            if "topic_id" not in columns:
+                await conn.execute(text("ALTER TABLE chat_history ADD COLUMN topic_id VARCHAR(32)"))
+                logger.info("[MemoryRepo] 迁移：chat_history 已添加 topic_id 列")
+
         logger.info(f"[MemoryRepo] Database initialized: {db_url}")
 
     def _get_session(self) -> AsyncSession:
@@ -104,31 +112,74 @@ class MemoryRepository:
         session_id: str,
         role: str,
         content: str,
+        topic_id: Optional[str] = None,
         user_id: Optional[str] = None,
         name: Optional[str] = None,
         timestamp: Optional[str] = None,
         tool_calls: Optional[dict] = None,
-    ) -> int:
+        message_fingerprint: Optional[str] = None,
+    ) -> Optional[int]:
         """
-        插入单条历史记录。
+        插入单条历史记录（幂等）。
 
-        :return: 新记录的自增 ID
+        若提供 message_fingerprint 且该 (session_id, fingerprint) 已存在，
+        则跳过插入并返回 None（利用 UNIQUE 约束的 ON CONFLICT DO NOTHING）。
+
+        :return: 新记录的自增 ID，或 None 表示重复跳过
         """
         async with self._get_session() as session:
-            msg = ChatHistory(
-                session_id=session_id,
-                role=role,
-                content=content,
-                user_id=user_id,
-                name=name,
-                timestamp=timestamp or _utc_now_iso(),
-                is_summarized=False,
-                tool_calls=tool_calls,
-            )
-            session.add(msg)
-            await session.commit()
-            await session.refresh(msg)
-            return msg.id
+            if message_fingerprint:
+                stmt = (
+                    insert(ChatHistory)
+                    .values(
+                        session_id=session_id,
+                        topic_id=topic_id,
+                        role=role,
+                        content=content,
+                        user_id=user_id,
+                        name=name,
+                        timestamp=timestamp or _utc_now_iso(),
+                        is_summarized=False,
+                        tool_calls=tool_calls,
+                        message_fingerprint=message_fingerprint,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=["session_id", "message_fingerprint"],
+                    )
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                if result.rowcount == 0:
+                    return None  # Duplicate fingerprint — skipped
+                # Fetch the inserted row's ID
+                stmt_id = (
+                    select(ChatHistory.id)
+                    .where(
+                        ChatHistory.session_id == session_id,
+                        ChatHistory.message_fingerprint == message_fingerprint,
+                    )
+                    .order_by(ChatHistory.id.desc())
+                    .limit(1)
+                )
+                row = await session.execute(stmt_id)
+                return row.scalar_one_or_none()
+            else:
+                # No fingerprint — legacy path, direct insert
+                msg = ChatHistory(
+                    session_id=session_id,
+                    topic_id=topic_id,
+                    role=role,
+                    content=content,
+                    user_id=user_id,
+                    name=name,
+                    timestamp=timestamp or _utc_now_iso(),
+                    is_summarized=False,
+                    tool_calls=tool_calls,
+                )
+                session.add(msg)
+                await session.commit()
+                await session.refresh(msg)
+                return msg.id
 
     async def get_recent_messages(
         self, session_id: str, limit: int = 50
@@ -151,6 +202,116 @@ class MemoryRepository:
         # 反转为正序（旧→新），并转为字典
         rows.reverse()
         return [self._row_to_dict(r) for r in rows]
+
+    async def get_messages_by_topic(
+        self, topic_id: str
+    ) -> List[Dict[str, Any]]:
+        """提取属于特定蚂蚁洞的所有历史，彻底屏蔽外界噪音"""
+        async with self._get_session() as session:
+            stmt = (
+                select(ChatHistory)
+                .where(ChatHistory.topic_id == topic_id)
+                .order_by(ChatHistory.id.asc())
+            )
+            result = await session.execute(stmt)
+            rows = list(result.scalars().all())
+        return [self._row_to_dict(r) for r in rows]
+
+    async def get_topic_id_by_message_id(self, platform_msg_id: str) -> Optional[str]:
+        """根据平台的原始消息 ID 反查对应的 topic_id"""
+        async with self._get_session() as session:
+            stmt = select(ChatHistory.topic_id).where(
+                ChatHistory.message_fingerprint == platform_msg_id
+            )
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
+    # 话题线程管理 (TopicThread)
+    # ------------------------------------------------------------------
+
+    async def upsert_topic_thread(
+        self,
+        topic_id: str,
+        session_id: str,
+        status: str = "ACTIVE",
+        participants: Optional[list] = None,
+    ) -> None:
+        """创建或更新话题线程"""
+        async with self._get_session() as session:
+            now = _utc_now_iso()
+            existing = await session.execute(
+                select(TopicThread).where(TopicThread.topic_id == topic_id)
+            )
+            row = existing.scalar_one_or_none()
+            if row:
+                row.status = status
+                row.last_active_at = now
+                if participants:
+                    existing_set = set(row.participants or [])
+                    row.participants = list(existing_set | set(participants))
+            else:
+                session.add(TopicThread(
+                    topic_id=topic_id,
+                    session_id=session_id,
+                    status=status,
+                    participants=participants or [],
+                    created_at=now,
+                    last_active_at=now,
+                ))
+            await session.commit()
+
+    async def get_topic_thread(self, topic_id: str) -> Optional[Dict[str, Any]]:
+        """获取单个话题线程"""
+        async with self._get_session() as session:
+            result = await session.execute(
+                select(TopicThread).where(TopicThread.topic_id == topic_id)
+            )
+            row = result.scalar_one_or_none()
+            if not row:
+                return None
+            return {
+                "topic_id": row.topic_id,
+                "session_id": row.session_id,
+                "status": row.status,
+                "summary": row.summary,
+                "participants": row.participants or [],
+                "created_at": row.created_at,
+                "last_active_at": row.last_active_at,
+            }
+
+    async def update_topic_status(
+        self, topic_id: str, status: str, summary: str = ""
+    ) -> None:
+        """更新话题状态（含可选摘要）"""
+        async with self._get_session() as session:
+            stmt = (
+                update(TopicThread)
+                .where(TopicThread.topic_id == topic_id)
+                .values(status=status, summary=summary, last_active_at=_utc_now_iso())
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def get_suspended_topics(self, stale_seconds: int = 1800) -> List[Dict[str, Any]]:
+        """获取所有 SUSPENDED 且超时的话题，用于归档"""
+        cutoff = datetime.now(timezone.utc).timestamp() - stale_seconds
+        cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+        async with self._get_session() as session:
+            stmt = select(TopicThread).where(
+                TopicThread.status == "SUSPENDED",
+                TopicThread.last_active_at < cutoff_iso,
+            )
+            result = await session.execute(stmt)
+            rows = list(result.scalars().all())
+        return [
+            {
+                "topic_id": r.topic_id,
+                "session_id": r.session_id,
+                "last_active_at": r.last_active_at,
+            }
+            for r in rows
+        ]
 
     async def get_unsummarized_messages(
         self, session_id: str
@@ -282,7 +443,7 @@ class MemoryRepository:
                     .on_conflict_do_update(
                         index_elements=["session_id", "user_id", "content"],
                         set_={
-                            "confidence": confidence,
+                            "confidence": func.max(UserTrait.confidence, confidence),
                             "updated_at": now,
                             "source_msg_id": source_msg_id or UserTrait.source_msg_id,
                         },
@@ -482,7 +643,7 @@ class MemoryRepository:
                         session_id=ent["session_id"],
                         name=ent.get("name", ""),
                         type=ent.get("type", ""),
-                        attributes=ent.get("attributes", {}),
+                        attributes=ent.get("attributes") or {},
                         updated_at=now,
                     )
                     .on_conflict_do_update(
@@ -561,7 +722,7 @@ class MemoryRepository:
                     continue
 
                 confidence = float(rel.get("confidence", 0.5))
-                evidence = rel.get("evidence_msg_ids", [])
+                evidence = rel.get("evidence_msg_ids") or []
 
                 # 先查询是否已存在（用于合并 evidence_msg_ids）
                 existing_stmt = select(Relation).where(
@@ -792,29 +953,23 @@ class MemoryRepository:
         """
         兼容旧接口：将 history 和 profile 写入数据库。
 
-        内部逐条写入 ChatHistory（跳过已存在的），更新 GroupMemory 和 UserTrait。
+        内部逐条写入 ChatHistory（依赖 fingerprint 去重），更新 GroupMemory 和 UserTrait。
         供 agent_service.py 过渡期调用。
         """
         try:
-            # 1. 写入历史消息（逐条 add_message，依赖 timestamp 去重）
+            # 1. 写入历史消息（逐条 add_message，依赖 fingerprint 幂等去重）
             for msg in history:
-                # 检查是否已存在（通过 timestamp + session_id + role 简单去重）
-                existing = await self._message_exists(
-                    session_id,
-                    msg.get("timestamp", ""),
-                    msg.get("role", ""),
-                    msg.get("content", ""),
+                fp = msg.get("message_fingerprint")
+                await self.add_message(
+                    session_id=session_id,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content", ""),
+                    user_id=msg.get("user_id"),
+                    name=msg.get("name"),
+                    timestamp=msg.get("timestamp"),
+                    tool_calls=msg.get("tool_calls"),
+                    message_fingerprint=fp,
                 )
-                if not existing:
-                    await self.add_message(
-                        session_id=session_id,
-                        role=msg.get("role", "user"),
-                        content=msg.get("content", ""),
-                        user_id=msg.get("user_id"),
-                        name=msg.get("name"),
-                        timestamp=msg.get("timestamp"),
-                        tool_calls=msg.get("tool_calls"),
-                    )
 
             # 2. 更新群组摘要
             summary = profile.get("summary", "")
@@ -822,7 +977,7 @@ class MemoryRepository:
                 await self.upsert_group_summary(session_id, summary)
 
             # 3. 更新群友画像
-            user_profiles = profile.get("user_profiles", {})
+            user_profiles = profile.get("user_profiles") or {}
             for uid, traits_str in user_profiles.items():
                 if traits_str and isinstance(traits_str, str):
                     traits_list = [

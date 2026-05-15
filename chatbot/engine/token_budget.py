@@ -16,13 +16,14 @@ Trimming priority (higher number = trimmed first):
 
 Performance note:
     Uses a two-phase counting strategy:
-    Phase 1: Rough estimate via len(text) / 3.35 (cheap)
+    Phase 1: Adaptive estimate based on character-class distribution (cheap)
     Phase 2: Precise count via tiktoken (only when estimate is close to budget)
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Optional
@@ -84,18 +85,49 @@ class SystemBlock:
 
 
 # ---------------------------------------------------------------------------
-# Token counting (two-phase: estimate then precise)
+# Adaptive token estimation
 # ---------------------------------------------------------------------------
 
-# Rough estimate: characters / 3.35 ≈ tokens (for Latin-heavy text)
-_CHARS_PER_TOKEN_ESTIMATE = 3.35
+# Pre-compiled regex for CJK character detection (CJK Unified Ideographs)
+_CJK_PATTERN = re.compile(r'[一-龥]')
+
+# Per-script chars/token ratios (calibrated against tiktoken cl100k_base)
+_RATIO_LATIN = 4.0    # ASCII / Latin scripts
+_RATIO_CJK = 1.8      # Chinese / Japanese / Korean characters
+_RATIO_OTHER = 3.0    # Other Unicode (emoji, Arabic, Cyrillic, etc.)
+
+
+def _adaptive_ratio(text: str) -> float:
+    """
+    Compute a weighted chars/token ratio based on the script distribution
+    of the input text.  O(n) scan, but n is typically < 10 KB so negligible.
+    """
+    if not text:
+        return _RATIO_LATIN
+
+    total = len(text)
+    cjk_count = len(_CJK_PATTERN.findall(text))
+    non_ascii = sum(1 for ch in text if ord(ch) > 127)
+    other_count = max(0, non_ascii - cjk_count)
+    latin_count = total - cjk_count - other_count
+
+    cjk_ratio = cjk_count / total
+    latin_ratio = latin_count / total
+    other_ratio = other_count / total
+
+    return (
+        latin_ratio * _RATIO_LATIN
+        + cjk_ratio * _RATIO_CJK
+        + other_ratio * _RATIO_OTHER
+    )
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate using character count. Very cheap."""
+    """Adaptive token estimate using character-class weighted ratio."""
     if not text:
         return 0
-    return math.ceil(len(text) / _CHARS_PER_TOKEN_ESTIMATE)
+    ratio = _adaptive_ratio(text)
+    return math.ceil(len(text) / ratio)
 
 
 def estimate_message_tokens(message: ChatMessage) -> int:
@@ -197,10 +229,11 @@ class TokenArbitrator:
       3. group_memory (5): items popped from end until empty.
       4. group_dynamics (4): items popped from end until empty.
       5. chat_history (3): messages shifted from oldest, keeping at least min_recent.
-      6. If still over budget after all trimming → TokenBudgetExceeded.
+      6. If still over budget → forced fallback trim (only never_cut + min_recent).
+      7. If fallback still exceeds budget → TokenBudgetExceeded.
 
     Performance:
-      Uses len/3.35 estimates during iterative trimming.
+      Uses adaptive estimates during iterative trimming.
       Switches to precise tiktoken counting for the final validation.
     """
 
@@ -265,18 +298,23 @@ class TokenArbitrator:
         # Sort trimmable by priority descending (highest number = trimmed first)
         trimmable.sort(key=lambda b: b.priority, reverse=True)
 
-        # Phase 1: Iterative trimming using rough estimates
+        # Phase 1: Iterative trimming using adaptive estimates
         blocks, history = self._trim_loop(never_cut, trimmable, history)
 
         # Phase 2: Precise validation with tiktoken
         total = self._count_precise(blocks, history)
         if total > self._max_tokens:
-            raise TokenBudgetExceeded(
-                f"Context requires {total} tokens (max {self._max_tokens}) "
-                f"even after all trimmable content removed.",
-                remaining_blocks=blocks,
-                remaining_history=history,
-            )
+            # Graceful degradation: forced fallback — strip all trimmable blocks
+            # and keep only never_cut + min_recent history
+            blocks, history = self._forced_fallback(never_cut, history)
+            total = self._count_precise(blocks, history)
+            if total > self._max_tokens:
+                raise TokenBudgetExceeded(
+                    f"Context requires {total} tokens (max {self._max_tokens}) "
+                    f"even after forced fallback trimming.",
+                    remaining_blocks=blocks,
+                    remaining_history=history,
+                )
 
         return blocks, history
 
@@ -310,6 +348,25 @@ class TokenArbitrator:
             history = self._trim_history(history, never_cut, trimmable)
 
         return never_cut + trimmable, history
+
+    def _forced_fallback(
+        self,
+        never_cut: list[SystemBlock],
+        history: list[ChatMessage],
+    ) -> tuple[list[SystemBlock], list[ChatMessage]]:
+        """
+        Graceful degradation: drop ALL trimmable content and keep only
+        never_cut blocks + min_recent history messages.
+        This is the last resort before raising TokenBudgetExceeded.
+        """
+        # Strip all trimmable blocks entirely — only never_cut survives
+        blocks = list(never_cut)
+
+        # Keep only the minimum recent messages
+        if len(history) > self._min_recent:
+            history = history[-self._min_recent:]
+
+        return blocks, history
 
     def _pop_items(
         self,

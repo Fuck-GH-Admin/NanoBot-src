@@ -151,7 +151,7 @@ class SemanticLorebook:
                     return None
 
                 data = resp.json()
-                items = data.get("data", [])
+                items = data.get("data") or []
                 # 按 index 排序，确保顺序与输入一致
                 items.sort(key=lambda x: x.get("index", 0))
                 vectors = [item["embedding"] for item in items]
@@ -198,11 +198,11 @@ class SemanticLorebook:
 
                 entry = self.entries[idx]
                 candidates.append({
-                    "key": entry.get("key", []),
-                    "content": entry.get("content", ""),
-                    "position": entry.get("position", 0),
-                    "depth": entry.get("depth", 4),
-                    "uid": entry.get("uid", ""),
+                    "key": entry.get("key") or [],
+                    "content": entry.get("content") or "",
+                    "position": entry["position"] if entry.get("position") is not None else 0,
+                    "depth": entry["depth"] if entry.get("depth") is not None else 4,
+                    "uid": entry.get("uid") or "",
                     "similarity": round(float(score), 4),
                     "_faiss_idx": int(idx),
                 })
@@ -260,7 +260,7 @@ class SemanticLorebook:
                     return None
 
                 data = resp.json()
-                results = data.get("results", [])
+                results = data.get("results") or []
                 if not results:
                     logger.warning("[SemanticLorebook] Reranker 返回空结果")
                     return None
@@ -315,7 +315,7 @@ class SemanticLorebook:
                     return None
 
                 data = resp.json()
-                items = data.get("data", [])
+                items = data.get("data") or []
                 if not items:
                     return None
 
@@ -348,7 +348,8 @@ def create_semantic_lorebook(config) -> Optional[SemanticLorebook]:
     embedding_url = f"{base_url}/embeddings"
     rerank_url = f"{base_url}/rerank"
 
-    worldbook_path = Path(__file__).resolve().parent.parent.parent.parent.parent / "config" / "worldbook.json"
+    from .path_utils import WORLDBOOK_PATH
+    worldbook_path = WORLDBOOK_PATH
     if not worldbook_path.exists():
         logger.info(f"[SemanticLorebook] worldbook.json 不存在: {worldbook_path}")
         return None

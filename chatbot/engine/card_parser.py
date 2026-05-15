@@ -230,9 +230,16 @@ def parse_character_card(data: Union[str, bytes, dict[str, Any]], *, format: str
         json_str = read_character_from_png_bytes(data)
         raw_dict = _parse_json_string(json_str)
     elif isinstance(data, str):
-        # Check if it looks like a file path
+        # Check if it looks like a file path.
+        # Guard: long strings (e.g. JSON/YAML content) must NOT be passed to
+        # Path.exists() — on Linux this triggers OSError: [Errno 36] File name too long.
+        _is_plausible_path = (
+            len(data) <= 255
+            and "\n" not in data
+            and not data.lstrip().startswith(("{", "[", "-", "#"))
+        )
         path = Path(data)
-        if path.exists() and path.is_file():
+        if _is_plausible_path and path.exists() and path.is_file():
             file_bytes = path.read_bytes()
             suffix = path.suffix.lower()
             if suffix == ".png" or format == "png":

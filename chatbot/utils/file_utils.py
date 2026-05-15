@@ -16,7 +16,7 @@ class AsyncFileUtils:
     @staticmethod
     async def read_json(path: Union[str, Path], default: Any = None) -> Any:
         path = Path(path)
-        if not path.exists():
+        if len(str(path)) > 255 or not path.exists():
             return default if default is not None else {}
         
         try:
@@ -33,6 +33,9 @@ class AsyncFileUtils:
     @staticmethod
     async def write_json(path: Union[str, Path], data: Any) -> bool:
         path = Path(path)
+        if len(str(path)) > 255:
+            logger.error(f"[FileUtils] 路径过长，可能非真实文件路径: {str(path)[:80]}...")
+            return False
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
 

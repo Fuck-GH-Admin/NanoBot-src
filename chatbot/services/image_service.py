@@ -33,7 +33,7 @@ class ImageService:
         keywords, classification, no_ai = self._parse_intent(text, allow_r18)
         
         # 2. 查询仓库
-        results = self.repo.query_images(keywords, classification, no_ai)
+        results = await self.repo.query_images(keywords, classification, no_ai)
         
         if not results:
             mode_str = classification if classification else "全年龄"
@@ -61,7 +61,7 @@ class ImageService:
             if "r18g" in text.lower(): classification = "R18G"
             elif "r18" in text.lower() or "涩图" in text: classification = "R18"
 
-        results = self.repo.query_images(keywords, classification, "不要ai" in text, limit=100)
+        results = await self.repo.query_images(keywords, classification, "不要ai" in text, limit=100)
         
         if not results:
             return [], "未找到符合关键词的图片"
@@ -97,6 +97,9 @@ class ImageService:
     def _process_stealth_sync(self, original_path: str, out_path: Path, strategy: int) -> str:
         """同步的 Pillow 图像处理逻辑，在线程池中执行以避免阻塞事件循环。"""
         try:
+            if len(original_path) > 255 or not os.path.isfile(original_path):
+                logger.warning(f"[ImageService] 原始路径无效或过长: {original_path[:80]}...")
+                return original_path
             img = Image.open(original_path).convert("RGBA")
             w, h = img.size
 

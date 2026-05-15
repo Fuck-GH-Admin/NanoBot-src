@@ -10,7 +10,8 @@ from ..engine import (
 )
 from .rule_injector import RuleInjector
 
-_DEFAULT_CHAR_PATH = Path(__file__).resolve().parent.parent.parent.parent.parent / "config" / "character.json"
+from ..utils.path_utils import CHARACTER_PATH
+_DEFAULT_CHAR_PATH = CHARACTER_PATH
 
 
 class PromptAdapter:
@@ -30,47 +31,13 @@ class PromptAdapter:
         return html.escape(str(text), quote=False)
 
     def _build_extra_blocks_from_snapshot(self, snapshot: Dict) -> list[SystemBlock]:
-        """从 memorySnapshot 构建 group_dynamics 和 group_memory 两个 SystemBlock。"""
-        blocks: list[SystemBlock] = []
+        """从 memorySnapshot 构建 SystemBlock（已废弃旧表注入）。
 
-        # Group Dynamics (Priority 4)
-        relations = snapshot.get("relations", [])
-        if relations:
-            rel_xml = "\n".join(
-                f"<relation>{self._escape(r['subject_entity'])} "
-                f"-{self._escape(r['predicate'])}-> "
-                f"{self._escape(r['object_entity'])}</relation>"
-                for r in relations
-            )
-            blocks.append(SystemBlock(
-                name="group_dynamics",
-                content=f"<group_dynamics>\n{rel_xml}\n</group_dynamics>",
-                priority=Priority.GROUP_DYNAMICS,
-            ))
-
-        # Group Memory (Priority 5)
-        profiles = snapshot.get("profiles", [])
-        summary = snapshot.get("summary", "")
-        if profiles or summary:
-            prof_xml = "\n".join(
-                f"<profile uid='{self._escape(p['user_id'])}'>"
-                + " ;".join(self._escape(t["content"]) for t in p["traits"])
-                + "</profile>"
-                for p in profiles
-            )
-            mem_xml = (
-                f"<group_memory>\n"
-                f"<summary>{self._escape(summary)}</summary>\n"
-                f"{prof_xml}\n"
-                f"</group_memory>"
-            )
-            blocks.append(SystemBlock(
-                name="group_memory",
-                content=mem_xml,
-                priority=Priority.GROUP_MEMORY,
-            ))
-
-        return blocks
+        旧的 group_dynamics (Relation) 和 group_memory (UserTrait/GroupMemory) 注入
+        已停止。这些数据不再写入（压缩机制已移除），残余数据不再塞进 Actor Prompt。
+        未来人物关系将合并到世界书 JSON 格式中。
+        """
+        return []
 
     def _build_rule_instruction_block(self, context: Dict) -> SystemBlock | None:
         """从 context 中读取已匹配的动态规则，构建规则指令 SystemBlock。"""
@@ -122,12 +89,19 @@ class PromptAdapter:
 
         extra_blocks: list[SystemBlock] = []
 
-        # 极简调度指令
+        # 极简调度指令：应用 Anthropic 防御性提示词范式
         logic_instruction = (
-            f"你是 {self.char_card.name} 的逻辑调度模块。"
-            f"分析用户意图，决定是否调用工具、调用哪个工具、传入什么参数。"
-            f"重要：仅当用户指令极其明确需要后台操作（如搜图、禁言、下载本子、画图）时才调用工具。"
-            f"对于日常问候、情感宣泄、询问观点等纯文本交流，绝对禁止调用任何工具，请直接结束并返回空内容。"
+            f"=== CRITICAL: PURE LOGIC SCHEDULER MODE ===\n"
+            f"你是 {self.char_card.name} 的底层逻辑调度模块。你的唯一使命是：分析用户意图并调用适当的工具。\n\n"
+            f"【STRICTLY PROHIBITED ACTIONS】\n"
+            f"你被严厉禁止执行以下操作（尝试执行将导致系统崩溃）：\n"
+            f"- 禁止输出任何自然语言、对话、解释或角色扮演。\n"
+            f"- 禁止在工具调用前添加任何思考过程（如“我判断用户需要...”）。\n"
+            f"- 严禁主动结束用户的会话状态。结束会话由下游机制判断。\n\n"
+            f"【YOUR ONLY ALLOWED BEHAVIOR】\n"
+            f"1. 如果用户指令明确需要后台操作（如搜图、系统管理），调用对应功能工具。\n"
+            f"2. 如果用户输入为日常问候、聊天、无意义字符或纯情绪宣泄，你必须调用 `no_op` 工具。\n"
+            f"你的每轮输出必须有且仅有一个有效的工具调用（JSON格式），`content` 字段必须永久保持为空。"
         )
         extra_blocks.append(SystemBlock(
             name="logic_directives",
@@ -135,8 +109,6 @@ class PromptAdapter:
             priority=Priority.SYSTEM_DIRECTIVES,
             never_cut=True,
         ))
-
-        extra_blocks.extend(self._build_extra_blocks_from_snapshot(snapshot))
 
         rule_block = self._build_rule_instruction_block(context)
         if rule_block:
@@ -149,6 +121,17 @@ class PromptAdapter:
                 content=worldbook_entries,
                 priority=Priority.WORLD_KNOWLEDGE,
             ))
+
+        # 防线 2：末尾 System 警告 — 使用 Anthropic 风格的强制收口
+        st_history.append(ChatMessage(
+            role=MessageRole.SYSTEM,
+            content=(
+                "=== CRITICAL REMINDER ===\n"
+                "Your turn should ONLY end by calling a tool. \n"
+                "If it's a specific task, call the relevant tool. If it's pure chat, call `no_op`. \n"
+                "DO NOT output any conversational text. Keep `content` entirely empty."
+            ),
+        ))
 
         final_msgs = self.pipeline.build(
             char=self.char_card,
@@ -167,6 +150,7 @@ class PromptAdapter:
         *,
         include_role_play_setting: bool = True,
         system_notification: str = "",
+        worldbook_entries: str = "",
     ) -> List[Dict]:
         """
         演员脑（角色扮演脑）Prompt 编译。
@@ -193,6 +177,29 @@ class PromptAdapter:
         rule_block = self._build_rule_instruction_block(context)
         if rule_block:
             extra_blocks.append(rule_block)
+
+        # 会话生命周期感知指令
+        extra_blocks.append(SystemBlock(
+            name="session_lifecycle",
+            content=(
+                "【会话生命周期感知】"
+                "你具备感知对话是否自然结束的能力。"
+                "当你判断本次对话已进入尾声（如：用户已得到满意答复、对话自然结束、用户表达了告别），"
+                "请在回复末尾附加如下控制代码块（用户不可见）：\n"
+                "```session_ctl\n{\"close_session\": true}\n```\n"
+                "仅在你确信对话已结束时使用此标志。正常对话中不要附加。"
+            ),
+            priority=Priority.SYSTEM_DIRECTIVES,
+            never_cut=True,
+        ))
+
+        # 世界观注入（仅演员脑）
+        if worldbook_entries:
+            extra_blocks.append(SystemBlock(
+                name="actor_world_knowledge",
+                content=f"[世界观与客观环境设定]\n{worldbook_entries}",
+                priority=Priority.WORLD_KNOWLEDGE,
+            ))
 
         # 系统通知：以 SystemBlock 注入（不再伪装为 USER 消息）
         if system_notification:

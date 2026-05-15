@@ -33,7 +33,7 @@ class BookService:
     """
     书籍业务服务
     职责：
-    1. 调度 JM 下载。
+    1. 异步调度 JM 下载（接单 -> 后台处理 -> 异步回调）。
     2. 协调 PDF 转换、加密、发送流程。
     3. 处理具体的业务彩蛋（苦命鸳鸯）。
     """
@@ -54,12 +54,16 @@ class BookService:
         else:
             await bot.send_private_msg(user_id=target_id, message=message)
 
-    async def handle_jm_download(self, bot: Bot, target_id: int, message_type: str, ids: List[str]) -> str:
+    # ================================================================
+    #  异步解耦入口：接单 -> 后台任务 -> 自动回调
+    # ================================================================
+
+    async def enqueue_jm_download(
+        self, bot: Bot, target_id: int, message_type: str, ids: List[str], user_id: str
+    ) -> str:
         """
-        [入口] 普通下载指令
-        :param target_id: 群号 或 用户QQ号
-        :param message_type: "group" 或 "private"
-        :param ids: 本子ID列表
+        [新入口] 异步解耦下载。
+        立即返回确认消息，后台启动下载任务。
         """
         if not self._check_env():
             return "❌ 环境配置不完整 (缺少库或 option.yml)"
@@ -67,7 +71,65 @@ class BookService:
         if not ids:
             return "❌ 请提供 ID"
 
-        logger.info(f"[JM] 开始下载任务: {ids}")
+        logger.info(f"[JM] 接单: {ids}, target={target_id}, type={message_type}")
+
+        # 启动后台任务，不等待完成
+        asyncio.create_task(
+            self._background_download_and_send(bot, target_id, message_type, ids, user_id)
+        )
+
+        id_str = ", ".join(ids)
+        return f"✅ 已将 [禁漫ID: {id_str}] 加入后台下载队列，完成后将自动发送，请不要重复下达指令。"
+
+    async def _background_download_and_send(
+        self,
+        bot: Bot,
+        target_id: int,
+        message_type: str,
+        ids: List[str],
+        user_id: str,
+    ):
+        """
+        后台下载 -> 打包 -> 发送 -> 清理 -> 通知。
+        全程不阻塞 NoneBot 事件循环。
+        """
+        try:
+            # 1. 下载（线程池隔离，不阻塞事件循环）
+            downloaded_items = await asyncio.to_thread(self._sync_download_task, ids)
+
+            if not downloaded_items:
+                await self._send_message(bot, target_id, message_type, "❌ 下载失败或无文件生成。")
+                return
+
+            # 2. 批量处理并发送（PDF转换 + 加密 + 上传）
+            result_msg = await self._batch_process_and_send(bot, target_id, message_type, downloaded_items)
+
+            # 3. 完成通知（@用户）
+            at_segment = f"[CQ:at,qq={user_id}]" if message_type == "group" else ""
+            await self._send_message(bot, target_id, message_type, f"{at_segment} 您点播的漫画下载完毕！\n{result_msg}")
+
+        except Exception as e:
+            logger.error(f"[JM] 后台任务异常: {e}")
+            try:
+                await self._send_message(bot, target_id, message_type, f"❌ 后台下载任务异常: {e}")
+            except Exception:
+                pass
+
+    # ================================================================
+    #  兼容旧入口（苦命鸳鸯彩蛋仍用同步模式）
+    # ================================================================
+
+    async def handle_jm_download(self, bot: Bot, target_id: int, message_type: str, ids: List[str]) -> str:
+        """
+        [旧入口] 同步下载（仅供彩蛋等内部调用）。
+        """
+        if not self._check_env():
+            return "❌ 环境配置不完整 (缺少库或 option.yml)"
+
+        if not ids:
+            return "❌ 请提供 ID"
+
+        logger.info(f"[JM] 同步下载任务: {ids}")
 
         # 1. 下载 (返回: [{'id':..., 'path':...}])
         downloaded_items = await self._run_sync_download(ids)
@@ -80,10 +142,6 @@ class BookService:
     async def handle_bitter_lovebirds(self, bot: Bot, group_id: int) -> str:
         """
         [入口] 苦命鸳鸯彩蛋 (350234, 350235)
-        逻辑：
-        1. 检查本地是否有这两个 ID 的书。
-        2. 缺少的 ID 进行下载。
-        3. 汇总列表统一发送。
         """
         if not self._check_env():
             return "❌ 环境不支持，无法触发彩蛋。"
@@ -96,12 +154,11 @@ class BookService:
 
         # 1. 检查本地库存
         for tid in target_ids:
-            # 询问 Repo 本地有没有
             local_path = self.repo.find_book_by_id_or_name(tid)
             if local_path:
                 final_items.append({
                     'id': tid,
-                    'title': local_path.stem,  # 使用文件名作为标题
+                    'title': local_path.stem,
                     'path': local_path
                 })
                 logger.info(f"[JM] 本地命中彩蛋资源: {local_path.name}")
@@ -117,14 +174,17 @@ class BookService:
         if not final_items:
             return "❌ 苦命鸳鸯彻底走散了... (无法获取资源)"
 
-        # 3. 统一发送 (强制指定为 group，因为此彩蛋通常用于群聊)
+        # 3. 统一发送
         await self._batch_process_and_send(bot, group_id, "group", final_items)
 
-        # 4. 专属结束语
         return "…这何尝不是一种苦命鸳鸯"
 
+    # ================================================================
+    #  核心流程
+    # ================================================================
+
     async def _batch_process_and_send(self, bot: Bot, target_id: int, message_type: str, items: List[Dict[str, Any]]) -> str:
-        """ 核心流程：转换 -> 注入随机UUID并加密 -> 发送 -> 清理临时文件 """
+        """核心流程：转换 -> 注入随机UUID并加密 -> 发送 -> 清理临时文件"""
         loop = asyncio.get_running_loop()
         success_count = 0
         failed_ids = []
@@ -159,13 +219,11 @@ class BookService:
             else:
                 target_pdf = source_path
 
-            # --- Step 2: 注入UUID + 加密 (仅对 PDF) ---
+            # --- Step 2: 注入UUID + 加密 ---
             ready_to_send = target_pdf
-            # 标记是否为临时生成的加密文件，用于后续删除
             is_temp_encrypted_file = False
 
             if ready_to_send.suffix.lower() == '.pdf':
-                # 创建一个位于 temp_dir 的临时文件名，包含随机串防止冲突
                 temp_filename = f"enc_{uuid.uuid4().hex[:8]}_{target_pdf.name}"
                 temp_enc_path = self.temp_dir / temp_filename
 
@@ -193,7 +251,6 @@ class BookService:
             logger.info(f"[JM] 发送: {ready_to_send.name} | Size: {file_size/1024/1024:.1f}MB | Timeout: {timeout:.0f}s")
 
             try:
-                # 根据类型调用不同的 API，用 asyncio.wait_for 实现真正的超时控制
                 api_name = "upload_group_file" if message_type == "group" else "upload_private_file"
                 api_kwargs: Dict[str, Any] = {
                     "file": str(ready_to_send.absolute()),
@@ -236,11 +293,9 @@ class BookService:
             reader = PdfReader(str(input_path))
             writer = PdfWriter()
 
-            # 1. 复制页面
             for page in reader.pages:
                 writer.add_page(page)
 
-            # 2. 注入随机 UUID 到 Metadata
             random_uid = str(uuid.uuid4())
             metadata = reader.metadata
             new_metadata = {k: v for k, v in metadata.items()} if metadata else {}
@@ -248,11 +303,8 @@ class BookService:
             new_metadata['/Producer'] = f"JM-Bot-{random_uid[:8]}"
 
             writer.add_metadata(new_metadata)
-
-            # 3. 加密
             writer.encrypt(password)
 
-            # 4. 输出
             with open(output_path, "wb") as f:
                 writer.write(f)
 
@@ -261,22 +313,39 @@ class BookService:
             logger.error(f"加密/混淆失败: {e}")
             return None
 
+    # ================================================================
+    #  下载引擎（线程池隔离）
+    # ================================================================
+
     async def _run_sync_download(self, ids: List[str]) -> List[Dict[str, Any]]:
         """执行下载任务 (线程池)"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sync_download_task, ids)
+        return await asyncio.to_thread(self._sync_download_task, ids)
 
     def _sync_download_task(self, ids: List[str]) -> List[Dict[str, Any]]:
-        """JM 下载逻辑实现"""
+        """
+        JM 下载逻辑实现（同步，在线程池中运行）。
+        强制注入 Clash 代理，确保网络可达。
+        """
         results = []
         try:
             option = jmcomic.JmOption.from_file(str(self.option_yaml_path))
             option.dir_rule.base_dir = str(self.temp_dir)
+
+            # ===== 强制注入 Clash 代理 =====
+            try:
+                option.client.proxies = {
+                    "http": "http://127.0.0.1:7890",
+                    "https": "http://127.0.0.1:7890",
+                }
+            except Exception as proxy_err:
+                logger.warning(f"[JM] 代理注入失败(非致命): {proxy_err}")
+            # ==============================
+
             downloader = jmcomic.JmDownloader(option)
 
             for album_id in ids:
                 try:
-                    # 0. 先检查最终目录 (Repo) 是否已有该 ID 的 ZIP
+                    # 0. 先检查本地是否已有
                     existing_book = self.repo.find_book_by_id_or_name(str(album_id))
                     if existing_book:
                         logger.info(f"[JM] 本地已存在，跳过下载: {existing_book.name}")
@@ -291,7 +360,7 @@ class BookService:
                     try:
                         album = downloader.client.get_album_detail(album_id)
                         title = album.title
-                    except:
+                    except Exception:
                         title = f"JM_{album_id}"
 
                     # 1. 检查下载缓存
@@ -334,8 +403,12 @@ class BookService:
 
         return results
 
+    # ================================================================
+    #  辅助方法
+    # ================================================================
+
     def _find_chapter_dirs(self, aid: str) -> List[str]:
-        """辅助：查找临时目录下的章节文件夹"""
+        """查找临时目录下的章节文件夹"""
         found = []
         if self.temp_dir.exists():
             for d in os.listdir(self.temp_dir):
@@ -345,7 +418,7 @@ class BookService:
         return found
 
     def _zip_folder(self, folder_path: str, output_path: Path):
-        """辅助：打包文件夹"""
+        """打包文件夹为 ZIP"""
         try:
             with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for root, _, files in os.walk(folder_path):

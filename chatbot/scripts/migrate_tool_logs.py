@@ -52,7 +52,7 @@ def migrate(db_path: str, dry_run: bool = False):
 
         for step_idx, tc in enumerate(tool_calls, 1):
             tc_id = tc.get("id", "")
-            func = tc.get("function", {})
+            func = tc.get("function") or {}
             tool_name = func.get("name", "unknown")
             arguments_str = func.get("arguments", "{}")
 
@@ -145,7 +145,14 @@ def main():
         try:
             from pathlib import Path
             import yaml
-            config_file = Path(__file__).resolve().parent.parent.parent.parent.parent / "config" / "config_bot_base.yaml"
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+            import nonebot
+            try:
+                nonebot.get_driver()
+            except ValueError:
+                nonebot.init()
+            from chatbot.utils.path_utils import CONFIG_FILE_PATH as config_file
             if config_file.exists():
                 with open(config_file, "r", encoding="utf-8") as f:
                     cfg = yaml.safe_load(f) or {}

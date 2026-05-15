@@ -31,7 +31,7 @@ class RuleInjector:
         - examples → 最多 2 条
         - 每条 example 的 input+call → 120 字符
         """
-        keywords: List[str] = rule.get("keywords", [])
+        keywords: List[str] = rule.get("keywords") or []
         tool_name: str = rule.get("tool_name", "")
         args_extractor: str = rule.get("args_extractor", "none")
         description: str = rule.get("description") or ""

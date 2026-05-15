@@ -58,7 +58,7 @@ class RuleEngineCore:
         candidates: list[dict] = []
 
         for rule in rules:
-            keywords: list[str] = rule.get("keywords", [])
+            keywords: list[str] = rule.get("keywords") or []
 
             # a. 关键词 AND：所有 keywords 必须都出现在 user_msg 中
             if not all(kw in user_msg for kw in keywords):
@@ -79,7 +79,7 @@ class RuleEngineCore:
                 r.get("priority", 0),
                 r.get("confidence", 0.0),
                 r.get("hit_count", 0),
-                sum(len(kw) for kw in r.get("keywords", [])),
+                sum(len(kw) for kw in r.get("keywords") or []),
             ),
             reverse=True,
         )
@@ -119,7 +119,7 @@ class RuleEngineCore:
             return False
 
         # 找到该关键词的结束位置
-        keywords: list[str] = rule.get("keywords", [])
+        keywords: list[str] = rule.get("keywords") or []
         best_end = -1
         for kw in keywords:
             idx = user_msg.find(kw)
@@ -170,7 +170,7 @@ class RuleEngineCore:
 
     @staticmethod
     def _extract_string_after_kw(rule: dict, user_msg: str) -> dict:
-        keywords: list[str] = rule.get("keywords", [])
+        keywords: list[str] = rule.get("keywords") or []
         best_end = -1
         for kw in keywords:
             idx = user_msg.find(kw)
@@ -202,7 +202,7 @@ class RuleEngineCore:
     @staticmethod
     def _find_last_keyword_pos(rule: dict, user_msg: str) -> int:
         """返回最后一个命中关键词在 user_msg 中的起始位置，未找到返回 -1。"""
-        keywords: list[str] = rule.get("keywords", [])
+        keywords: list[str] = rule.get("keywords") or []
         best = -1
         for kw in keywords:
             idx = user_msg.find(kw)
@@ -220,7 +220,7 @@ class RuleEngineCore:
             return ""
 
         # 找到该位置对应关键词的结束
-        keywords: list[str] = rule.get("keywords", [])
+        keywords: list[str] = rule.get("keywords") or []
         best_end = pos
         for kw in keywords:
             idx = user_msg.find(kw)

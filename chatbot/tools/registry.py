@@ -93,8 +93,66 @@ class ToolRegistry:
 
 
 class AgentToolRegistry(ToolRegistry):
-    """数据面注册表：LLM 可见工具"""
-    pass
+    """数据面注册表：LLM 可见工具，含请求级防重放拦截"""
+
+    # 同一 request 内，相同 (tool_name, normalized_args) 的最大执行次数
+    MAX_EXEC_PER_SIGNATURE = 2
+
+    def __init__(self) -> None:
+        super().__init__()
+        # {request_id: {signature: execution_count}}
+        self._request_counters: dict[str, dict[str, int]] = {}
+
+    def begin_request(self, request_id: str) -> None:
+        """初始化一个请求级别的执行计数器。"""
+        self._request_counters[request_id] = {}
+
+    def end_request(self, request_id: str) -> None:
+        """清理请求级别的执行计数器。"""
+        self._request_counters.pop(request_id, None)
+
+    def _check_and_record(self, request_id: str, tool_name: str, arguments: dict) -> tuple[bool, str]:
+        """
+        检查是否超过单请求执行上限。
+        返回 (allowed, error_message)。
+        """
+        if not request_id:
+            return True, ""
+
+        counters = self._request_counters.get(request_id)
+        if counters is None:
+            # No active request tracking — allow (fallback)
+            return True, ""
+
+        import json
+        try:
+            normalized = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            normalized = str(arguments)
+        sig = f"{tool_name}|{normalized}"
+
+        count = counters.get(sig, 0)
+        if count >= self.MAX_EXEC_PER_SIGNATURE:
+            return False, (
+                f"防重放拦截：工具 '{tool_name}' 在同一请求中已执行 {count} 次，"
+                f"超过上限 {self.MAX_EXEC_PER_SIGNATURE}。"
+            )
+        counters[sig] = count + 1
+        return True, ""
+
+    async def execute_tool(self, name: str, arguments: Dict, context: Dict) -> tuple[str, list[str]]:
+        """
+        执行工具（带请求级防重放校验）。
+        context 中的 'request_id' 用于追踪同一请求内的重复调用。
+        """
+        request_id = context.get("request_id", "")
+        allowed, deny_reason = self._check_and_record(request_id, name, arguments)
+        if not allowed:
+            from nonebot.log import logger
+            logger.warning(f"[AgentToolRegistry] {deny_reason}")
+            return deny_reason, []
+
+        return await super().execute_tool(name, arguments, context)
 
 
 class SystemToolRegistry(ToolRegistry):

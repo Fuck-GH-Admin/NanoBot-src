@@ -64,8 +64,8 @@ class BanUserTool(BaseTool):
         )
 
         import time
-        from ...repositories.memory_repo import MemoryRepo
-        await MemoryRepo().insert_tool_log(
+        from ...repositories.memory_repo import MemoryRepository
+        await MemoryRepository().insert_tool_log(
             session_id=f"group_{group_id}",
             request_id=f"ban_{target_id}_{int(time.time())}",
             step=1,
