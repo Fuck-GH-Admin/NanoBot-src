@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from nonebot.log import logger
 
-from .models import Base, ChatHistory, GroupMemory, UserTrait, CompactionJournal, Entity, Relation, ToolExecutionLog, TopicThread
+from .models import Base, ChatHistory, GroupMemory, UserTrait, CompactionJournal, Entity, Relation, ToolExecutionLog, TopicThread, EventLog
 
 
 def _utc_now_iso() -> str:
@@ -1105,3 +1105,56 @@ class MemoryRepository:
                 }
                 for r in rows
             ]
+
+
+class EventStore:
+    """EventStoreProtocol 的 SQLite 实现，桥接 MemoryRepository 的连接池。"""
+
+    def __init__(self, repo: MemoryRepository):
+        self._repo = repo
+
+    async def append_event(self, event: "ConversationEvent") -> "ConversationEvent":
+        from ..runtime.events import ConversationEvent, EventType
+        from types import MappingProxyType
+
+        async with self._repo._get_session() as session:
+            session.add(EventLog(
+                event_id=event.event_id,
+                correlation_id=event.correlation_id,
+                causation_id=event.causation_id,
+                session_id=event.session_id,
+                epoch=event.epoch,
+                type=event.type.value if isinstance(event.type, EventType) else event.type,
+                source=event.source,
+                payload=dict(event.payload),
+            ))
+            await session.commit()
+
+        return event
+
+    async def load_stream(self, session_id: str) -> List["ConversationEvent"]:
+        from ..runtime.events import ConversationEvent, EventType
+        from types import MappingProxyType
+
+        async with self._repo._get_session() as session:
+            stmt = (
+                select(EventLog)
+                .where(EventLog.session_id == session_id)
+                .order_by(EventLog.id.asc())
+            )
+            result = await session.execute(stmt)
+            rows = list(result.scalars().all())
+
+        return [
+            ConversationEvent(
+                event_id=r.event_id,
+                correlation_id=r.correlation_id,
+                causation_id=r.causation_id,
+                session_id=r.session_id,
+                epoch=r.epoch,
+                type=EventType(r.type),
+                source=r.source,
+                payload=MappingProxyType(r.payload or {}),
+            )
+            for r in rows
+        ]

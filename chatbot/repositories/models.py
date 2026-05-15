@@ -232,3 +232,26 @@ class ToolExecutionLog(Base):
 
     def __repr__(self) -> str:
         return f"<ToolExecutionLog id={self.id} tool={self.tool_name} session={self.session_id}>"
+
+
+class EventLog(Base):
+    """事件溯源日志：ConversationRuntime 的持久化层"""
+    __tablename__ = "event_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    correlation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    causation_id: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    timestamp: Mapped[str] = mapped_column(String(32), default=_utc_now_iso)
+
+    __table_args__ = (
+        Index("ix_event_log_session_epoch", "session_id", "epoch"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<EventLog id={self.id} type={self.type} session={self.session_id} epoch={self.epoch}>"

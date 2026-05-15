@@ -143,6 +143,8 @@ def _collect_existing_keys(session_id: str) -> set[str]:
 async def _extract_lore_from_topic(topic_id: str, messages: list, session_id: str = "") -> list:
     """
     从话题对话中提炼客观设定（世界观、人物特征等）。
+    采用 Map-Reduce 模式：先通过关键词匹配收集语义相关的现有条目（Top-10），
+    再让 LLM 对比提取，避免全量注入导致的 Token 爆炸。
     返回符合 SillyTavern 世界书格式的条目列表，无新设定则返回空列表。
     """
     api_key = plugin_config.deepseek_api_key
@@ -161,48 +163,73 @@ async def _extract_lore_from_topic(topic_id: str, messages: list, session_id: st
             condensed.append(f"[{role}] {content[:500]}")
     prompt_text = "\n".join(condensed)
 
-    # 收集已知关键词，注入提示词实现源头去重
-    existing_keys = _collect_existing_keys(session_id) if session_id else set()
-    existing_keys_block = ""
-    if existing_keys:
-        keys_str = "、".join(sorted(existing_keys))
-        existing_keys_block = (
-            f"\n\n【已知设定关键词（本群已收录）】\n{keys_str}\n"
-        )
+    # 防错：仅注入语义相关的 Baseline（Top-10），避免 Token 爆炸
+    # 从最近消息中提取关键词用于匹配
+    recent_text = " ".join(m.get("content", "") for m in messages[-10:] if m.get("content"))
+    recent_words = set(recent_text.lower().split())
+
+    base = get_project_root(Path(__file__)) / "config"
+    scored_entries = []  # (score, entry_str)
+    for fname in ("worldbook.json", "draft_worldbook.json"):
+        fpath = base / fname
+        if not fpath.exists():
+            continue
+        try:
+            data = json.loads(fpath.read_text(encoding="utf-8"))
+            entries = data.get("entries", []) if isinstance(data, dict) else data
+            for e in entries:
+                scope = e.get("custom_scope", "global")
+                if scope != "global" and scope != session_id:
+                    continue
+                keys = e.get("key") or e.get("keys") or []
+                content_text = str(e.get("content", ""))
+                # 计算关键词与最近消息的重叠度作为相关性分数
+                key_words = set()
+                for k in keys:
+                    if isinstance(k, str):
+                        key_words.update(k.lower().split())
+                overlap = len(key_words & recent_words)
+                if overlap > 0:
+                    scored_entries.append((overlap, f"[{','.join(keys)}] {content_text[:100]}..."))
+        except Exception:
+            pass
+
+    # 按相关性降序排列，取 Top-10
+    scored_entries.sort(key=lambda x: -x[0])
+    relevant_entries = [e[1] for e in scored_entries[:10]]
+
+    baseline_block = ""
+    if relevant_entries:
+        baseline_str = "\n".join(relevant_entries)
+        baseline_block = f"\n\n<current_worldbook_entries>\n{baseline_str}\n</current_worldbook_entries>\n"
 
     logger.info(
         f"[Harvester] 话题 {topic_id[:8]} 开始提炼: "
         f"{len(messages)} 条消息, {len(condensed)} 条有效, "
         f"prompt 约 {len(prompt_text)} 字符, "
-        f"已知关键词 {len(existing_keys)} 个"
+        f"相关设定条目 {len(relevant_entries)}/{len(scored_entries)} 个"
     )
 
     system_prompt = (
-        "你是一个从群聊对话中提炼持久化设定的助手。\n"
-        "请从以下对话中提取值得长期记住的设定信息。\n\n"
+        "你是一个设定集架构师，负责维护角色的设定一致性。\n"
+        "你的任务是分析 <recent_chat_history>，提取值得长期记住的新设定，"
+        "并避免与 <current_worldbook_entries> 中的记录重复。\n\n"
         "【值得提取的内容】\n"
-        "- 世界观设定：地名、组织、势力、规则体系、历史背景\n"
-        "- 人物设定：角色名、身份、能力、外貌、性格特征、所属阵营\n"
-        "- 专有名词：特殊术语、道具、技能名及其含义\n"
-        "- 关系网络：角色间的固定关系（师徒、敌对、队友等）\n"
-        "- 重要事件：有长期影响的事件（非日常琐事）\n\n"
-        "【不需要提取的】\n"
-        "- 纯粹的打招呼、表情包、无意义回复\n"
-        "- 明显的一次性闲聊（如\"今天好困\"）\n\n"
-        "【宁可多提，不要漏提】\n"
-        "如果不确定是否算设定，倾向于提取。宁可让管理员审核时丢弃，也不要遗漏重要设定。\n"
-        f"{existing_keys_block}\n"
-        "【防重复约束 — 极度严格】\n"
-        "- **绝对禁止提取已知设定**：如果对话中提到的实体属于上述已知关键词，"
-        "且没有提供革命性的、打破常规的新细节，直接忽略，不允许生成条目。\n"
-        "- **补充优于新建**：如果对话为已知设定提供了重要补充，请提取一个包含原有核心关键词的新条目，"
-        "并在 content 中着重描写【补充细节】。\n"
-        "- **精准去重**：本次提取的多个 entries 内部，绝对不能出现描述同一实体的多条设定，"
-        "必须自行在输出前合并。\n\n"
+        "- 角色名、身份、特殊术语、具有长期影响的事件或关系。\n\n"
+        "【执行规则】\n"
+        "1. 如果对话中提到的信息在 <current_worldbook_entries> 中已有相似描述，直接忽略，不生成条目。\n"
+        "2. 如果对话为已知设定提供了革命性的细节补充，提取一个包含原核心关键词的新条目，说明为【补充细节】。\n"
+        "3. 绝对禁止提取一次性闲聊。\n"
+        f"{baseline_block}"
         "【输出格式】\n"
-        "你必须输出一个 JSON 对象，包含 `entries` 键，值为数组。每个元素格式：\n"
-        '{"entries": [{"key": ["关键词1", "关键词2"], "content": "设定描述", "constant": false}]}\n'
-        '如果没有值得提取的内容，输出：{"entries": []}'
+        "返回 JSON 数组，必须包含 confidence 字段（0.0 到 1.0）：\n"
+        '{"entries": [{"key": ["关键词"], "content": "设定描述", "confidence": 0.95, "constant": false}]}\n'
+        "置信度说明：\n"
+        "- 1.0：对话中明确陈述的事实性设定（如角色自报身份）\n"
+        "- 0.8：高度可信的推断（如多次提及的一致信息）\n"
+        "- 0.5：可能的设定，需要人工确认\n"
+        "- 0.3：模糊推测，强烈建议人工审核\n"
+        '如果没有新设定，输出：{"entries": []}'
     )
 
     request_body = {
@@ -328,23 +355,43 @@ async def _archive_topic(topic_id: str, session_id: str, repo) -> None:
                 logger.info(f"[Harvester] 话题 {topic_id[:8]} 未提炼出设定（空结果）")
 
             if lore_entries and not isinstance(lore_entries, Exception):
-                # 写入草稿箱
-                from .world_book import DraftWorldBook
+                # 置信度分流：高置信度直接转正，低置信度落入草稿箱
+                from .world_book import DraftWorldBook, WorldBook
+                from ..utils.path_utils import WORLDBOOK_PATH
                 draft_wb = DraftWorldBook(str(DRAFT_WORLDBOOK_PATH))
+                main_wb = WorldBook(str(WORLDBOOK_PATH))
+
+                auto_approved = []
+                pending_review = []
                 for entry in lore_entries:
                     entry["custom_scope"] = session_id
-                    await draft_wb.append_entry(entry)
+                    confidence = float(entry.get("confidence", 0.0))
+                    content_len = len(entry.get("content", ""))
 
-                # 通知管理员（带重试，Bot 实例可能尚未就绪）
-                keys_str = ", ".join(k for e in lore_entries for k in e.get("key", []))
+                    # 高置信度且文本具有足够信息熵，直接转正
+                    if confidence >= 0.85 and content_len > 15:
+                        logger.info(f"[Harvester] 高置信度条目直接转正: {entry.get('key', [])} (conf={confidence})")
+                        await main_wb.append_entry(entry)
+                        auto_approved.append(entry)
+                    else:
+                        await draft_wb.append_entry(entry)
+                        pending_review.append(entry)
+
+                # 通知管理员
+                keys_approved = ", ".join(k for e in auto_approved for k in e.get("key", []))
+                keys_pending = ", ".join(k for e in pending_review for k in e.get("key", []))
                 content_preview = lore_entries[0].get("content", "")[:80]
                 notify_msg = (
                     f"[Worldbook Auto-Lore]\n"
-                    f"已从 {session_id} 的对话中提炼出 {len(lore_entries)} 条新设定草稿：\n"
-                    f"关键词：{keys_str}\n"
-                    f"内容：{content_preview}...\n"
-                    f"请前往 Web 控制台「世界书」标签审核。"
+                    f"已从 {session_id} 的对话中提炼出 {len(lore_entries)} 条新设定：\n"
                 )
+                if auto_approved:
+                    notify_msg += f"自动转正 ({len(auto_approved)} 条): {keys_approved}\n"
+                if pending_review:
+                    notify_msg += f"待审核 ({len(pending_review)} 条): {keys_pending}\n"
+                notify_msg += f"内容预览：{content_preview}...\n"
+                if pending_review:
+                    notify_msg += "请前往 Web 控制台「世界书」标签审核待确认条目。"
                 superusers = list(plugin_config.superusers)
                 if not superusers:
                     logger.warning("[Harvester] 无 superusers 配置，跳过通知")

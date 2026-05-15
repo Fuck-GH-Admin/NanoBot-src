@@ -77,13 +77,19 @@ def _get_key_set(entry: dict) -> set[str]:
     return {k for k in keys if isinstance(k, str) and k}
 
 
-def _should_merge(set_a: set[str], set_b: set[str]) -> bool:
+def _should_merge(entry_a: dict, entry_b: dict) -> bool:
     """
-    判断两个 key 集合是否应合并。满足任一条件即合并：
-    1. 完全一致
-    2. Jaccard 相似度 ≥ 0.5
-    3. 其中一个是另一个的子集（且两者都非空）
+    判断两个条目是否应合并。满足任一条件即合并：
+    1. key 集合完全一致
+    2. key 集合存在子集关系
+    3. Jaccard ≥ 0.5（严格）
+    4. Jaccard ≥ 0.3 + 文本关联性检测（关键词出现在对方 content 中）
     """
+    set_a = _get_key_set(entry_a)
+    set_b = _get_key_set(entry_b)
+    content_a = entry_a.get("content", "")
+    content_b = entry_b.get("content", "")
+
     if not set_a or not set_b:
         return False
 
@@ -91,15 +97,24 @@ def _should_merge(set_a: set[str], set_b: set[str]) -> bool:
     if set_a == set_b:
         return True
 
-    # 条件 3：子集关系（必须在 Jaccard 之前检查，因为子集可能 Jaccard < 0.5）
+    # 条件 2：子集关系
     if set_a <= set_b or set_b <= set_a:
         return True
 
-    # 条件 2：Jaccard ≥ 0.5
+    # 条件 3：Jaccard ≥ 0.5（严格匹配）
     intersection = len(set_a & set_b)
     union = len(set_a | set_b)
-    if union > 0 and intersection / union >= 0.5:
+    jaccard = intersection / union if union > 0 else 0
+
+    if jaccard >= 0.5:
         return True
+
+    # 条件 4：Jaccard ≥ 0.3 + 文本关联性检测
+    if jaccard >= 0.3:
+        overlap_a_in_b = any(k.lower() in content_b.lower() for k in set_a)
+        overlap_b_in_a = any(k.lower() in content_a.lower() for k in set_b)
+        if overlap_a_in_b or overlap_b_in_a:
+            return True
 
     return False
 
@@ -107,7 +122,7 @@ def _should_merge(set_a: set[str], set_b: set[str]) -> bool:
 def _cluster_entries(entries: list[dict]) -> list[list[int]]:
     """
     保守聚类：仅当两个条目的 key 满足严格相似条件时才连通。
-    使用并查集，但边的判定条件远比"只要有交集"严格。
+    使用并查集，边的判定条件支持 key 集合相似度 + 文本关联性。
     """
     n = len(entries)
     parent = list(range(n))
@@ -139,7 +154,7 @@ def _cluster_entries(entries: list[dict]) -> list[list[int]]:
         for j in range(i + 1, n):
             if not key_sets[j]:
                 continue
-            if _should_merge(key_sets[i], key_sets[j]):
+            if _should_merge(entries[i], entries[j]):
                 union(i, j)
 
     # 收集簇（仅返回 2+ 条目的簇）

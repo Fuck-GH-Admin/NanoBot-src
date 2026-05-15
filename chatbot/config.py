@@ -88,6 +88,7 @@ class Config(BaseSettings):
     entity_relation_enabled: bool = False   # 阶段三：知识图谱实体/关系提取
     semantic_lorebook_enabled: bool = False  # 阶段三：语义向量检索
     token_arbitration_enabled: bool = False  # 阶段三：Token 预算仲裁
+    enable_aesam_runtime: bool = False      # 阶段四：事件溯源运行时（ConversationRuntime）
 
     # 画图
     drawing_enhance_timeout: float = Field(default=30.0, description="画图提示词优化的超时时间")
@@ -264,6 +265,7 @@ class ConfigManager:
             "entity_relation_enabled": False,
             "semantic_lorebook_enabled": False,
             "token_arbitration_enabled": False,
+            "enable_aesam_runtime": False,
             "siliconflow_api_key": "",
             "siliconflow_api_url": "https://api.siliconflow.cn/v1",
             "siliconflow_model_name": "Kwai-Kolors/Kolors",
